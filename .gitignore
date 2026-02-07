@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Project specific - Runtime data
+data/sent_posts.json
+data/shared_posts.json
+/sent_posts.json
+/posts.json
+
+# Project specific - Logs
+*.log
+logs/
+
+# Project specific - Debug
+debug/
+/debug_*.png
+
+# Project specific - Generated outputs
+output/
+/boguszow_gorce_temp_map_final.png
+
+# Design source files
+*.xcf
+*.psd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+
+# Docker persistent data (contains sensitive session data)
+docker-data/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Old project files at root level (kept during transition)
+/bg_scraper.py
+/send_facebook_notification.py
+/bg_weather_map_selenium.py
+/bg_wather_map.png
+/bg_wather_map001.png
+/bg_wather_map.xcf
+/map.png
+/map001.png
+/scrape.log

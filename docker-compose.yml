@@ -1,0 +1,27 @@
+services:
+  selenium-chrome:
+    # Using version 131 - stable and well-tested
+    image: selenium/standalone-chrome:131.0
+    container_name: bg-selenium-chrome
+    shm_size: 4gb
+    ports:
+      - "4445:4444"      # Selenium WebDriver (offset from wchNews 4444)
+      - "7901:7900"      # noVNC for viewing browser (offset from wchNews 7900)
+    volumes:
+      # Persist Chrome profile for Facebook session
+      - ./docker-data/chrome-profile:/home/seluser/.config/google-chrome
+      # Share output directory for generated images
+      - ./output:/home/seluser/output
+    environment:
+      - SE_NODE_MAX_SESSIONS=1
+      - SE_SESSION_REQUEST_TIMEOUT=300
+      - SE_NODE_SESSION_TIMEOUT=600
+      - SE_SCREEN_WIDTH=1920
+      - SE_SCREEN_HEIGHT=1080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

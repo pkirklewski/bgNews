@@ -1,0 +1,15 @@
+# Web scraping and browser automation
+selenium>=4.16.0
+undetected-chromedriver>=3.5.4
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+playwright>=1.40.0
+
+# Image processing
+Pillow>=10.1.0
+
+# Virtual display (optional for headless operation)
+pyvirtualdisplay>=3.0
+
+# Additional dependencies
+lxml>=4.9.0
