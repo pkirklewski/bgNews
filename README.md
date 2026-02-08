@@ -9,9 +9,9 @@ Three automation pillars run on a schedule via cron:
 
 | Script | Purpose | Schedule |
 |--------|---------|----------|
-| `src/bg_weather_map_selenium.py` | Weather map with temps for 7 districts | 06:30, 19:15 |
+| `src/bg_weather_map_selenium.py` | Weather map with temps for 7 districts + share to 3 groups | 06:30, 19:15 |
 | `src/bg_scraper_selenium.py` | Web scraper (3 sources, "Bogusz" filter) | 07:00, 11:00, 15:00, 19:00 |
-| `src/bg_fb_share.py` | Auto-share posts from 4 monitored FB pages | 07:15, 11:15, 15:15, 19:15 |
+| `src/bg_fb_share.py` | Auto-share posts from 4 monitored FB pages | 07:30, 11:30, 15:30, 19:30 |
 
 All Facebook interaction runs through a Selenium Chrome instance in Docker.
 
@@ -47,6 +47,18 @@ Temperature data from [Open-Meteo API](https://open-meteo.com/) for 7 districts:
 Lubominek, Chelmiec, Gorce, Boguszow-Gorce, Stary Lesieniec, Kuznice Swidnickie, Dzikowiec.
 
 Regenerate maps: `python design/source_images/generate_maps.py`
+
+## Group Sharing (Weather Map)
+
+After posting the weather map, the script automatically shares it to 3 Facebook groups
+(as personal profile "Piotr Kirklewski"):
+- BOGUSZÓW-GORCE
+- Ogłoszenia Boguszów-Gorce
+- Społeczność Kuźnic
+
+Group sharing switches from the page profile to personal profile, navigates to the
+post, clicks Share > Share to group, searches for the group, enters a caption,
+and publishes. All steps are logged with debug screenshots.
 
 ## Web Sources (Scraper)
 

@@ -70,10 +70,14 @@ OUTPUT_IMAGE_FILENAME = "boguszow_gorce_temp_map_final.png"
 # Process isolation & locking
 LOCK_FILE = PROJECT_ROOT / "locks" / "weather_map.lock"
 
-# Group sharing - DISABLED for Boguszów-Gorce
-SHARE_TO_GROUPS_ENABLED = False
-SHARE_TO_GROUPS = []
-SHARE_DELAY_SECONDS = 15
+# Group sharing - share weather map to local Facebook groups after posting to page
+SHARE_TO_GROUPS_ENABLED = True
+SHARE_TO_GROUPS = [
+    "BOGUSZÓW-GORCE",               # "BOGUSZÓW-GORCE/Ogłoszenia/Informacje/Sprzedam/Kupię/Zamienię/"
+    "Ogłoszenia Boguszów-Gorce",     # "Ogłoszenia Boguszów-Gorce"
+    "Społeczność Kuźnic",            # "Społeczność Kuźnic"
+]
+SHARE_DELAY_SECONDS = 15  # Delay between group shares to avoid rate limiting
 PERSONAL_PROFILE_NAME = "Piotr Kirklewski"
 
 # ============================================
@@ -1694,6 +1698,623 @@ def post_to_facebook_selenium(driver, image_path: str, caption: str, test_mode: 
 
 
 # ============================================
+# GROUP SHARING FUNCTIONS
+# ============================================
+
+def get_latest_post_url(driver) -> str:
+    """Get the URL of the most recent post on the page feed.
+
+    After posting, navigates back to the page and finds the newest post link.
+    Falls back to page URL if no specific post URL is found.
+
+    Returns:
+        Post URL string, or FB_PAGE_URL as fallback.
+    """
+    try:
+        logger.info("=" * 50)
+        logger.info("🔍 LOOKING FOR LATEST POST URL")
+        logger.info("=" * 50)
+        logger.info(f"📍 Navigating to page: {FB_PAGE_URL}")
+
+        driver.get(FB_PAGE_URL)
+        human_delay(3, 5)
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_01_page_loaded.png"))
+        logger.info("📸 Screenshot saved: debug_group_share_01_page_loaded.png")
+
+        # Log current URL to verify we're on the right page
+        logger.info(f"📍 Current URL after navigation: {driver.current_url}")
+
+        # Find post links - look for posts with timestamps that link to individual posts
+        post_link_selectors = [
+            "//a[contains(@href, '/posts/')]",
+            "//a[contains(@href, 'story_fbid')]",
+            "//a[contains(@href, '/permalink/')]",
+        ]
+
+        for selector in post_link_selectors:
+            try:
+                links = driver.find_elements(By.XPATH, selector)
+                logger.info(f"🔍 Selector '{selector}' found {len(links)} links")
+                for link in links[:5]:  # Check first 5 matches
+                    href = link.get_attribute('href')
+                    if href and ('posts' in href or 'story_fbid' in href or 'permalink' in href):
+                        # Clean up the URL
+                        if '?' in href:
+                            href = href.split('?')[0]
+                        logger.info(f"✅ Found post URL: {href}")
+                        return href
+            except Exception as e:
+                logger.debug(f"Selector {selector} failed: {e}")
+                continue
+
+        logger.warning("⚠️ Could not find specific post URL, falling back to page URL")
+        logger.warning(f"⚠️ Fallback URL: {FB_PAGE_URL}")
+        return FB_PAGE_URL
+
+    except Exception as e:
+        logger.error(f"❌ Error getting post URL: {e}")
+        import traceback
+        traceback.print_exc()
+        return FB_PAGE_URL
+
+
+def switch_to_personal_profile(driver) -> bool:
+    """Switch from page profile back to personal profile for group sharing.
+
+    Group sharing must be done as a personal profile, not as a page.
+    Uses the same 3-stage menu approach: top-right menu -> see all profiles -> click personal.
+
+    Returns:
+        True if switch succeeded (or was already on personal), False on failure.
+    """
+    try:
+        logger.info("=" * 50)
+        logger.info(f"🔄 SWITCHING TO PERSONAL PROFILE: {PERSONAL_PROFILE_NAME}")
+        logger.info("=" * 50)
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_02_before_profile_switch.png"))
+        logger.info("📸 Screenshot saved: debug_group_share_02_before_profile_switch.png")
+
+        # Step 1: Click on profile menu (top-right)
+        menu_selectors = [
+            "//div[@role='button'][@aria-label='Twój profil']",
+            "//div[@role='button'][@aria-label='Your profile']",
+            "//div[@aria-label='Konto' and @role='button']",
+            "//div[@aria-label='Account' and @role='button']",
+        ]
+
+        menu_clicked = False
+        for selector in menu_selectors:
+            try:
+                logger.info(f"🔍 [Menu] Trying selector: {selector}")
+                menu_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                menu_btn.click()
+                menu_clicked = True
+                logger.info(f"✅ [Menu] Clicked profile menu: {selector}")
+                human_delay(2, 3)
+                break
+            except Exception as e:
+                logger.debug(f"[Menu] Selector failed: {selector} - {e}")
+                continue
+
+        if not menu_clicked:
+            logger.error("❌ [Menu] Could not find profile menu button")
+            logger.error("❌ [Menu] Available elements on page (role='button'):")
+            try:
+                buttons = driver.find_elements(By.XPATH, "//div[@role='button']")
+                for btn in buttons[:10]:
+                    aria = btn.get_attribute('aria-label') or '(no aria-label)'
+                    text = btn.text[:50] if btn.text else '(no text)'
+                    logger.error(f"    - aria-label='{aria}', text='{text}'")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_error_no_menu.png"))
+            logger.error("📸 Screenshot saved: debug_group_share_error_no_menu.png")
+            return False
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_03_menu_opened.png"))
+        logger.info("📸 Screenshot saved: debug_group_share_03_menu_opened.png")
+
+        # Step 2: Look for personal profile name or "See all profiles" in the menu
+        profile_selectors = [
+            f"//span[contains(text(), '{PERSONAL_PROFILE_NAME}')]",
+            f"//div[contains(text(), '{PERSONAL_PROFILE_NAME}')]",
+            "//span[contains(text(), 'Zobacz wszystkie profile')]",
+            "//span[contains(text(), 'See all profiles')]",
+        ]
+
+        profile_found = False
+        for selector in profile_selectors:
+            try:
+                logger.info(f"🔍 [Profile] Trying selector: {selector}")
+                profile_btn = WebDriverWait(driver, 3).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                profile_btn.click()
+                logger.info(f"✅ [Profile] Clicked: {selector}")
+                profile_found = True
+                human_delay(2, 3)
+
+                # If we clicked "See all profiles", now look for personal profile in the list
+                if 'wszystkie' in selector.lower() or 'all profiles' in selector.lower():
+                    logger.info("📋 [Profile] 'See all profiles' expanded, looking for personal profile...")
+                    driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_04_all_profiles.png"))
+                    logger.info("📸 Screenshot saved: debug_group_share_04_all_profiles.png")
+                    try:
+                        personal = WebDriverWait(driver, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, f"//span[contains(text(), '{PERSONAL_PROFILE_NAME}')]"))
+                        )
+                        personal.click()
+                        logger.info(f"✅ [Profile] Switched to personal profile: {PERSONAL_PROFILE_NAME}")
+                        human_delay(2, 3)
+                    except Exception as e:
+                        logger.warning(f"⚠️ [Profile] Could not find personal profile in list: {e}")
+                        # Log what profiles ARE visible
+                        try:
+                            spans = driver.find_elements(By.XPATH, "//div[@role='dialog']//span")
+                            logger.warning(f"⚠️ [Profile] Visible spans in dialog ({len(spans)} total):")
+                            for s in spans[:15]:
+                                if s.text.strip():
+                                    logger.warning(f"    - '{s.text.strip()}'")
+                        except Exception:
+                            pass
+                break
+            except Exception as e:
+                logger.debug(f"[Profile] Selector failed: {selector} - {e}")
+                continue
+
+        if not profile_found:
+            logger.warning("⚠️ [Profile] Could not find profile switch button, may already be on personal profile")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_error_no_profile.png"))
+            logger.warning("📸 Screenshot saved: debug_group_share_error_no_profile.png")
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_05_after_profile_switch.png"))
+        logger.info("📸 Screenshot saved: debug_group_share_05_after_profile_switch.png")
+        logger.info("✅ [Profile] Profile switch procedure completed")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ [Profile] Error switching profile: {e}")
+        import traceback
+        traceback.print_exc()
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_error_switch.png"))
+        logger.error("📸 Screenshot saved: debug_group_share_error_switch.png")
+        return False
+
+
+def share_post_to_group(driver, post_url: str, group_search_name: str, caption: str) -> bool:
+    """Share a post to a specific Facebook group.
+
+    Flow: navigate to post -> click Share -> Share to group -> search group ->
+    select group -> enter caption -> publish.
+
+    Args:
+        driver: Selenium WebDriver instance
+        post_url: URL of the post to share
+        group_search_name: Search term to find the group in the share dialog
+        caption: Text to add to the shared post
+
+    Returns:
+        True if sharing succeeded, False otherwise.
+    """
+    safe_group_name = "".join(c if c.isalnum() else "_" for c in group_search_name[:20])
+
+    try:
+        logger.info("=" * 50)
+        logger.info(f"📤 SHARING TO GROUP: {group_search_name}")
+        logger.info(f"📍 Post URL: {post_url}")
+        logger.info(f"📛 Safe name for screenshots: {safe_group_name}")
+        logger.info("=" * 50)
+
+        # --- Step 1: Navigate to the post ---
+        logger.info(f"🔗 [Step 1/6] Navigating to post...")
+        driver.get(post_url)
+        human_delay(3, 5)
+
+        logger.info(f"📍 Current URL: {driver.current_url}")
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_01_post_loaded.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_01_post_loaded.png")
+
+        # --- Step 2: Find and click Share button (Udostępnij) ---
+        logger.info(f"🔍 [Step 2/6] Looking for Share button...")
+        share_selectors = [
+            "//span[text()='Udostępnij']",
+            "//span[text()='Share']",
+            "//div[@aria-label='Wyślij do innych']",
+            "//div[@aria-label='Send this to friends or post it on your timeline']",
+        ]
+
+        share_clicked = False
+        for selector in share_selectors:
+            try:
+                logger.info(f"  🔍 Trying: {selector}")
+                share_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                share_btn.click()
+                share_clicked = True
+                logger.info(f"  ✅ Clicked share button: {selector}")
+                human_delay(2, 3)
+                break
+            except Exception as e:
+                logger.debug(f"  Share selector failed: {selector} - {e}")
+                continue
+
+        if not share_clicked:
+            logger.error("❌ [Step 2/6] Could not find Share button on post")
+            # Log what's visible for debugging
+            try:
+                spans = driver.find_elements(By.XPATH, "//span")
+                share_like_spans = [s.text for s in spans if s.text and ('udostępnij' in s.text.lower() or 'share' in s.text.lower())]
+                logger.error(f"❌ Spans containing 'share/udostępnij': {share_like_spans[:10]}")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_no_share.png"))
+            return False
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_02_share_menu.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_02_share_menu.png")
+
+        # --- Step 3: Click "Udostępnij w grupie" / "Share to a group" ---
+        logger.info(f"🔍 [Step 3/6] Looking for 'Share to group' option...")
+        group_share_selectors = [
+            "//span[text()='Udostępnij w grupie']",
+            "//span[text()='Share to a group']",
+            "//span[contains(text(), 'grupie')]",
+            "//span[contains(text(), 'group')]",
+        ]
+
+        group_option_clicked = False
+        for selector in group_share_selectors:
+            try:
+                logger.info(f"  🔍 Trying: {selector}")
+                group_btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                group_btn.click()
+                group_option_clicked = True
+                logger.info(f"  ✅ Clicked 'Share to group': {selector}")
+                human_delay(2, 3)
+                break
+            except Exception as e:
+                logger.debug(f"  Group share selector failed: {selector} - {e}")
+                continue
+
+        if not group_option_clicked:
+            logger.error("❌ [Step 3/6] Could not find 'Share to group' option in share menu")
+            # Log visible menu items for debugging
+            try:
+                menu_items = driver.find_elements(By.XPATH, "//div[@role='menuitem']//span | //div[@role='menu']//span")
+                logger.error(f"❌ Menu items visible ({len(menu_items)}):")
+                for item in menu_items[:10]:
+                    if item.text.strip():
+                        logger.error(f"    - '{item.text.strip()}'")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_no_group_option.png"))
+            return False
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_03_group_dialog.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_03_group_dialog.png")
+
+        # --- Step 4: Search for the group ---
+        logger.info(f"🔍 [Step 4/6] Looking for group search input...")
+        search_selectors = [
+            "//input[@placeholder='Szukaj grup']",
+            "//input[@placeholder='Search groups']",
+            "//input[contains(@placeholder, 'grup')]",
+            "//input[contains(@placeholder, 'group')]",
+            "//div[@role='dialog']//input[@type='search']",
+            "//div[@role='dialog']//input[@type='text']",
+        ]
+
+        search_input = None
+        for selector in search_selectors:
+            try:
+                logger.info(f"  🔍 Trying: {selector}")
+                search_input = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, selector))
+                )
+                if search_input:
+                    logger.info(f"  ✅ Found search input: {selector}")
+                    logger.info(f"  📋 Input placeholder: '{search_input.get_attribute('placeholder')}'")
+                    break
+            except Exception as e:
+                logger.debug(f"  Search selector failed: {selector} - {e}")
+                continue
+
+        if not search_input:
+            logger.error("❌ [Step 4/6] Could not find group search input")
+            # Log all inputs in dialog for debugging
+            try:
+                inputs = driver.find_elements(By.XPATH, "//div[@role='dialog']//input")
+                logger.error(f"❌ Inputs in dialog ({len(inputs)}):")
+                for inp in inputs[:5]:
+                    logger.error(f"    - type='{inp.get_attribute('type')}', placeholder='{inp.get_attribute('placeholder')}'")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_no_search.png"))
+            return False
+
+        logger.info(f"⌨️ Typing search term: '{group_search_name}'")
+        search_input.clear()
+        search_input.send_keys(group_search_name)
+        human_delay(2, 3)
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_04_search_results.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_04_search_results.png")
+
+        # --- Step 5: Click on the group result ---
+        logger.info(f"🔍 [Step 5/6] Looking for group in search results...")
+        # Use first 30 chars of group name for matching
+        search_fragment = group_search_name[:30]
+        group_result_selectors = [
+            f"//span[contains(text(), '{search_fragment}')]",
+            f"//div[contains(text(), '{search_fragment}')]",
+            "//div[@role='listitem']",
+            "//div[@role='option']",
+        ]
+
+        group_selected = False
+        for selector in group_result_selectors:
+            try:
+                logger.info(f"  🔍 Trying: {selector}")
+                group_result = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, selector))
+                )
+                # Log what we're about to click
+                result_text = group_result.text[:80] if group_result.text else '(no text)'
+                logger.info(f"  📋 Element text: '{result_text}'")
+                group_result.click()
+                group_selected = True
+                logger.info(f"  ✅ Selected group from results: {selector}")
+                human_delay(2, 3)
+                break
+            except Exception as e:
+                logger.debug(f"  Group result selector failed: {selector} - {e}")
+                continue
+
+        if not group_selected:
+            logger.error(f"❌ [Step 5/6] Could not select group: {group_search_name}")
+            # Log what's visible in the dialog
+            try:
+                dialog_spans = driver.find_elements(By.XPATH, "//div[@role='dialog']//span")
+                logger.error(f"❌ Spans in dialog ({len(dialog_spans)}):")
+                for s in dialog_spans[:15]:
+                    if s.text.strip():
+                        logger.error(f"    - '{s.text.strip()}'")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_no_result.png"))
+            return False
+
+        # Wait for "Utwórz post" dialog
+        human_delay(2, 3)
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_05_create_post.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_05_create_post.png")
+
+        # Try to enter caption in textbox
+        # NOTE: We need to find the textbox in the "Utwórz post" share dialog specifically,
+        # NOT the comment textbox on the underlying post page. The comment box has
+        # aria-placeholder="Skomentuj jako..." while the share dialog textbox has
+        # aria-placeholder="Powiedz coś o tym..." or similar.
+        textbox_selectors = [
+            # Share dialog-specific textbox (Polish "Say something about this...")
+            "//div[@role='dialog']//div[@role='textbox'][contains(@aria-placeholder, 'Powiedz')]",
+            "//div[@role='dialog']//div[@role='textbox'][contains(@aria-placeholder, 'Say something')]",
+            # "Utwórz publiczny post" label
+            "//div[@aria-label='Utwórz publiczny post…']",
+            "//div[@aria-label='Create a public post…']",
+            # Generic dialog textbox - but EXCLUDE comment boxes
+            "//div[@role='dialog']//div[@role='textbox'][@contenteditable='true'][not(contains(@aria-placeholder, 'Skomentuj'))]",
+        ]
+
+        textbox = None
+        for selector in textbox_selectors:
+            try:
+                logger.info(f"  🔍 Trying textbox: {selector}")
+                textbox = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, selector))
+                )
+                if textbox:
+                    placeholder = textbox.get_attribute('aria-placeholder') or ''
+                    label = textbox.get_attribute('aria-label') or ''
+                    logger.info(f"  ✅ Found textbox: {selector}")
+                    logger.info(f"  📋 Placeholder: '{placeholder}', Label: '{label}'")
+                    break
+            except Exception as e:
+                logger.debug(f"  Textbox selector failed: {selector} - {e}")
+                continue
+
+        if textbox:
+            # Use JavaScript click + focus to avoid ElementClickInterceptedException
+            # The share dialog textbox can be obscured by overlapping elements
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", textbox)
+                human_delay(0.3, 0.5)
+                driver.execute_script("arguments[0].click();", textbox)
+                logger.info("  ✅ Clicked textbox via JavaScript")
+            except Exception as e:
+                logger.warning(f"  ⚠️ JS click on textbox failed: {e}")
+            human_delay(0.5, 1)
+
+            logger.info(f"⌨️ Entering caption ({len(caption)} chars)...")
+            escaped_caption = caption.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+            driver.execute_script(f'''
+                var el = arguments[0];
+                el.focus();
+                document.execCommand('insertText', false, "{escaped_caption}");
+            ''', textbox)
+            logger.info("✅ Caption entered successfully")
+            human_delay(1, 2)
+        else:
+            logger.warning("⚠️ Could not find textbox, posting without caption")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_warning_no_textbox.png"))
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_06_before_publish.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_06_before_publish.png")
+
+        # --- Step 6: Click "Udostępnij" / "Opublikuj" / "Post" ---
+        logger.info(f"🔍 [Step 6/6] Looking for Publish/Share button...")
+        publish_selectors = [
+            # The share dialog uses "Udostępnij" (Share) button, not "Opublikuj" (Publish)
+            "//div[@role='dialog']//div[@aria-label='Utwórz post']//span[text()='Udostępnij']",
+            "//div[@role='dialog']//span[text()='Udostępnij'][ancestor::div[contains(@class, 'x1qjc9v5')]]",
+            "//div[@role='dialog']//span[text()='Opublikuj']",
+            "//div[@role='dialog']//span[text()='Post']",
+            "//div[@role='dialog']//span[text()='Share']",
+            "//div[@aria-label='Opublikuj']",
+            "//div[@aria-label='Post']",
+        ]
+
+        publish_clicked = False
+        for selector in publish_selectors:
+            try:
+                logger.info(f"  🔍 Trying: {selector}")
+                publish_btn = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.XPATH, selector))
+                )
+                # Use JavaScript click to avoid intercept issues
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", publish_btn)
+                human_delay(0.3, 0.5)
+                try:
+                    publish_btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", publish_btn)
+                publish_clicked = True
+                logger.info(f"  ✅ Clicked publish: {selector}")
+                human_delay(3, 5)
+                break
+            except Exception as e:
+                logger.debug(f"  Publish selector failed: {selector} - {e}")
+                continue
+
+        if not publish_clicked:
+            logger.error(f"❌ [Step 6/6] Could not find publish button for group: {group_search_name}")
+            # Log visible buttons in dialog
+            try:
+                buttons = driver.find_elements(By.XPATH, "//div[@role='dialog']//div[@role='button']//span")
+                logger.error(f"❌ Buttons in dialog ({len(buttons)}):")
+                for b in buttons[:10]:
+                    if b.text.strip():
+                        logger.error(f"    - '{b.text.strip()}'")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_no_publish.png"))
+            return False
+
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_07_after_publish.png"))
+        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_07_after_publish.png")
+
+        logger.info(f"✅ Successfully shared to group: {group_search_name}")
+        logger.info("=" * 50)
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error sharing to group '{group_search_name}': {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_exception.png"))
+            logger.error(f"📸 Screenshot: debug_share_{safe_group_name}_error_exception.png")
+        except Exception:
+            logger.error("❌ Could not save error screenshot")
+        # Try to close any open dialogs to clean up for next group
+        try:
+            close_btns = driver.find_elements(By.XPATH, "//div[@role='dialog']//div[@aria-label='Zamknij' or @aria-label='Close']")
+            for btn in close_btns:
+                try:
+                    driver.execute_script("arguments[0].click();", btn)
+                    logger.info("🧹 Closed open dialog after error")
+                    human_delay(0.5, 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Press Escape as a final fallback to close dialogs
+        try:
+            from selenium.webdriver.common.keys import Keys
+            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+            human_delay(0.5, 1)
+            logger.info("🧹 Pressed Escape to close any remaining dialogs")
+        except Exception:
+            pass
+        return False
+
+
+def share_to_all_groups(driver, post_url: str, caption: str) -> int:
+    """Share post to all configured Facebook groups.
+
+    Switches to personal profile first (group sharing must be done as personal account),
+    then iterates through SHARE_TO_GROUPS with delays between each share.
+
+    Args:
+        driver: Selenium WebDriver instance
+        post_url: URL of the post to share
+        caption: Caption text for shared posts
+
+    Returns:
+        Number of successful shares (0 to len(SHARE_TO_GROUPS)).
+    """
+    if not SHARE_TO_GROUPS_ENABLED:
+        logger.info("ℹ️ Group sharing is disabled (SHARE_TO_GROUPS_ENABLED=False)")
+        return 0
+
+    if not SHARE_TO_GROUPS:
+        logger.info("ℹ️ No groups configured for sharing (SHARE_TO_GROUPS is empty)")
+        return 0
+
+    logger.info("=" * 60)
+    logger.info(f"📤 STARTING GROUP SHARING: {len(SHARE_TO_GROUPS)} groups configured")
+    for i, name in enumerate(SHARE_TO_GROUPS):
+        logger.info(f"  {i+1}. {name}")
+    logger.info(f"📍 Post URL: {post_url}")
+    logger.info(f"⏱️ Delay between shares: {SHARE_DELAY_SECONDS}s (+0-5s random)")
+    logger.info("=" * 60)
+
+    # First switch to personal profile (required for group sharing)
+    logger.info("🔄 Step 1: Switching to personal profile...")
+    if not switch_to_personal_profile(driver):
+        logger.error("❌ Could not switch to personal profile, aborting all group shares")
+        logger.error("❌ This means we're still logged in as the page, which cannot share to groups")
+        return 0
+
+    successful_shares = 0
+    failed_groups = []
+
+    for i, group_name in enumerate(SHARE_TO_GROUPS):
+        logger.info(f"--- Group {i+1}/{len(SHARE_TO_GROUPS)}: {group_name} ---")
+
+        if share_post_to_group(driver, post_url, group_name, caption):
+            successful_shares += 1
+            logger.info(f"✅ [{i+1}/{len(SHARE_TO_GROUPS)}] Shared to: {group_name}")
+        else:
+            failed_groups.append(group_name)
+            logger.error(f"❌ [{i+1}/{len(SHARE_TO_GROUPS)}] Failed to share to: {group_name}")
+
+        # Delay between shares (except for last one)
+        if i < len(SHARE_TO_GROUPS) - 1:
+            delay = SHARE_DELAY_SECONDS + random.uniform(0, 5)
+            logger.info(f"⏳ Waiting {delay:.0f}s before next group share...")
+            time.sleep(delay)
+
+    logger.info("=" * 60)
+    logger.info(f"📊 GROUP SHARING SUMMARY:")
+    logger.info(f"  Total groups: {len(SHARE_TO_GROUPS)}")
+    logger.info(f"  Successful: {successful_shares}")
+    logger.info(f"  Failed: {len(failed_groups)}")
+    if failed_groups:
+        logger.info(f"  Failed groups: {failed_groups}")
+    logger.info("=" * 60)
+
+    return successful_shares
+
+
+# ============================================
 # MAIN
 # ============================================
 
@@ -1726,9 +2347,18 @@ def main():
             return
 
     try:
+        import datetime as _dt
+        start_time = time.time()
         logger.info("=" * 60)
         logger.info(">>> Rozpoczynam generowanie mapy pogodowej Boguszów-Gorce (Selenium)...")
+        logger.info(f">>> Start time: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f">>> TEST_MODE={TEST_MODE}, USE_VIRTUAL_DISPLAY={USE_VIRTUAL_DISPLAY}")
+        logger.info(f">>> SHARE_TO_GROUPS_ENABLED={SHARE_TO_GROUPS_ENABLED}")
+        logger.info(f">>> SHARE_TO_GROUPS={SHARE_TO_GROUPS}")
+        logger.info(f">>> FB_PAGE_URL={FB_PAGE_URL}")
+        logger.info(f">>> PERSONAL_PROFILE_NAME={PERSONAL_PROFILE_NAME}")
+        logger.info(f">>> MAPS_DIR={MAPS_DIR}")
+        logger.info(f">>> OVERLAY_ENABLED={OVERLAY_ENABLED}")
         if TEST_MODE:
             logger.info(">>> 🧪 TRYB TESTOWY - cały pipeline będzie przetestowany, ale post NIE zostanie opublikowany")
         logger.info("=" * 60)
@@ -1812,6 +2442,30 @@ def main():
                     logger.info("🧪 TEST MODE: Pipeline test completed successfully!")
                 else:
                     logger.info("🎉 Post opublikowany pomyślnie!")
+
+                    # Share to groups (only in production mode after successful post)
+                    if SHARE_TO_GROUPS_ENABLED and SHARE_TO_GROUPS:
+                        logger.info("=" * 60)
+                        logger.info("📤 Starting group sharing phase...")
+                        logger.info(f"📤 Groups to share to: {len(SHARE_TO_GROUPS)}")
+                        logger.info("=" * 60)
+
+                        # Get the URL of the post we just created
+                        post_url = get_latest_post_url(driver)
+                        logger.info(f"📍 Post URL for sharing: {post_url}")
+
+                        # Prepare group share caption
+                        group_caption = caption  # Use same caption as the page post
+
+                        # Share to all configured groups
+                        shares_count = share_to_all_groups(driver, post_url, group_caption)
+
+                        if shares_count > 0:
+                            logger.info(f"🎉 Successfully shared to {shares_count}/{len(SHARE_TO_GROUPS)} groups!")
+                        else:
+                            logger.warning(f"⚠️ No successful group shares (0/{len(SHARE_TO_GROUPS)})")
+                    else:
+                        logger.info("ℹ️ Group sharing skipped (disabled or no groups configured)")
             else:
                 logger.error("❌ Nie udało się opublikować posta")
 
@@ -1826,6 +2480,7 @@ def main():
                 human_delay(2, 3)
                 logger.info("Closing browser...")
                 driver.quit()
+                logger.info("✅ Browser closed")
 
     finally:
         # ============================================
@@ -1834,6 +2489,15 @@ def main():
         if virtual_display:
             virtual_display.stop()
             logger.info("🖥️ Stopped virtual display")
+
+        try:
+            elapsed = time.time() - start_time
+            logger.info("=" * 60)
+            logger.info(f">>> FINISHED: Total runtime {elapsed:.0f}s ({elapsed/60:.1f} min)")
+            logger.info(f">>> End time: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("=" * 60)
+        except Exception:
+            logger.info(">>> FINISHED")
 
 
 if __name__ == "__main__":
