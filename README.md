@@ -26,7 +26,7 @@ bgnews/
 │   ├── docker_selenium.py          # Docker Selenium connection helper
 │   ├── docker_fb_login.py          # Interactive FB login setup
 │   └── chrome_profile_manager.py   # Chrome profile health manager
-├── assets/weather_maps/          # Pre-composed condition maps (10) + overlay
+├── assets/weather_maps/          # Pre-composed condition maps (13) + overlay
 ├── design/source_images/         # Base map + map generation script
 ├── data/                         # Runtime data (sent/shared posts JSON)
 ├── docker-data/                  # Chrome profile (gitignored)
@@ -40,8 +40,9 @@ bgnews/
 
 ## Weather Maps
 
-10 condition-based maps generated from a base map + weather icons:
-sun, cloud_sun, cloud, fog, rain_light, rain, rain_snow, snow_light, snow, storm.
+13 condition-based maps generated from a base map + weather icons:
+sun, moon, cloud_sun, cloud_moon, cloud, fog, fog_moon, rain_light, rain, rain_snow, snow_light, snow, storm.
+Night variants (moon, cloud_moon, fog_moon) are used automatically for evening runs.
 
 Temperature data from [Open-Meteo API](https://open-meteo.com/) for 7 districts:
 Lubominek, Chelmiec, Gorce, Boguszow-Gorce, Stary Lesieniec, Kuznice Swidnickie, Dzikowiec.
@@ -116,3 +117,7 @@ Each script has a `TEST_MODE` flag at the top. Set to `True` to run the full pip
 | 7901 | noVNC (browser view, password: `secret`) |
 
 Chrome profile persists in `docker-data/chrome-profile/` (volume mount).
+
+## Changelog
+
+- **2026-02-10** — Add night mode maps (moon, cloud_moon, fog_moon) — automatically used for evening runs

@@ -149,19 +149,20 @@ def release_script_lock():
 # MAPOWANIE KODÓW WMO NA PLIKI MAP
 # ============================================
 
-def get_map_for_code(code: int) -> str:
+def get_map_for_code(code: int, mode: str = "day") -> str:
     """
     Zwraca nazwę pliku mapy na podstawie kodu pogody WMO.
     Każda mapa ma już nałożoną odpowiednią ikonę pogody.
+    W trybie nocnym (mode="night") używa wariantów z księżycem.
     """
     if code == 0:
-        return "map_sun.png"
+        return "map_moon.png" if mode == "night" else "map_sun.png"
     elif code in [1, 2]:
-        return "map_cloud_sun.png"
+        return "map_cloud_moon.png" if mode == "night" else "map_cloud_sun.png"
     elif code == 3:
         return "map_cloud.png"
     elif code in [45, 48]:
-        return "map_fog.png"
+        return "map_fog_moon.png" if mode == "night" else "map_fog.png"
     elif code in [51, 53, 61, 80]:
         return "map_rain_light.png"
     elif code in [55, 63, 65, 81, 82]:
@@ -957,12 +958,12 @@ def draw_text_centered(draw, x, y, text, font, color, stroke_width=3, stroke_fil
     draw.text((pos_x, pos_y), text, font=font, fill=color,
               stroke_width=stroke_width, stroke_fill=stroke_fill)
 
-def generate_map_image(districts_data: list, weather_code: int) -> tuple:
+def generate_map_image(districts_data: list, weather_code: int, mode: str = "day") -> tuple:
     """
     Generuje mapę z temperaturami.
-    Wybiera odpowiednią mapę bazową na podstawie kodu pogody.
+    Wybiera odpowiednią mapę bazową na podstawie kodu pogody i trybu (dzień/noc).
     """
-    map_filename = get_map_for_code(weather_code)
+    map_filename = get_map_for_code(weather_code, mode)
     input_path = MAPS_DIR / map_filename
     output_path = PROJECT_ROOT / "output" / OUTPUT_IMAGE_FILENAME
 
@@ -2376,10 +2377,11 @@ def main():
         # 2. Fetch forecast for center (Boguszów-Gorce) and generate professional forecast
         forecast = fetch_forecast_center()
 
+        mode = forecast.get('forecast_mode', 'day') if forecast else 'day'
+
         try:
             if forecast and forecast.get('hourly') and forecast['hourly'].get('temps'):
                 # Use professional forecast
-                mode = forecast.get('forecast_mode', 'day')
                 forecast_text = generate_professional_forecast_text(forecast['hourly'], mode)
                 logger.info("✅ Using professional meteorological forecast")
             elif forecast:
@@ -2395,10 +2397,10 @@ def main():
 
         # 3. Get weather code for map selection (Boguszów-Gorce center - index 3)
         weather_code = districts_weather[3]['code'] if len(districts_weather) > 3 else 3
-        logger.info(f"📊 Kod pogody dla Boguszowa-Gorc: {weather_code}")
+        logger.info(f"📊 Kod pogody dla Boguszowa-Gorc: {weather_code} (mode: {mode})")
 
         # 4. Generate map image (with appropriate weather icon map)
-        map_path, min_t, max_t = generate_map_image(districts_weather, weather_code)
+        map_path, min_t, max_t = generate_map_image(districts_weather, weather_code, mode)
 
         if not map_path:
             logger.error("Nie udało się wygenerować mapy. Przerywam.")
