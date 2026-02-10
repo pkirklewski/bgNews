@@ -1739,6 +1739,10 @@ def get_latest_post_url(driver) -> str:
                 for link in links[:5]:  # Check first 5 matches
                     href = link.get_attribute('href')
                     if href and ('posts' in href or 'story_fbid' in href or 'permalink' in href):
+                        # Only accept posts from our own page (not from followed pages)
+                        if 'kangurello' not in href and '100027689516729' not in href:
+                            logger.debug(f"  Skipping foreign post: {href[:80]}")
+                            continue
                         # Clean up the URL
                         if '?' in href:
                             href = href.split('?')[0]

@@ -579,7 +579,10 @@ def share_post(driver, post: dict) -> bool:
             "arguments[0].scrollIntoView({block: 'center'});", share_btn
         )
         human_delay(0.5, 1)
-        share_btn.click()
+        try:
+            share_btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", share_btn)
         logger.info("  Clicked Share button")
         human_delay(2, 3)
 

@@ -58,7 +58,9 @@ After posting the weather map, the script automatically shares it to 3 Facebook 
 
 Group sharing switches from the page profile to personal profile, navigates to the
 post, clicks Share > Share to group, searches for the group, enters a caption,
-and publishes. All steps are logged with debug screenshots.
+and publishes. Post URL detection filters for the page's own posts (kangurello /
+100027689516729) to avoid sharing foreign posts from the feed. All steps are logged
+with debug screenshots.
 
 ## Web Sources (Scraper)
 
