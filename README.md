@@ -120,4 +120,5 @@ Chrome profile persists in `docker-data/chrome-profile/` (volume mount).
 
 ## Changelog
 
+- **2026-02-10** — Update post caption template to match unified format (cleaner forecast text, new charity block)
 - **2026-02-10** — Add night mode maps (moon, cloud_moon, fog_moon) — automatically used for evening runs

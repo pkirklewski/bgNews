@@ -460,7 +460,7 @@ def generate_professional_forecast_text(hourly_data, mode):
     """
     if not hourly_data or not hourly_data.get('temps'):
         logger.warning("⚠️ No hourly data for professional forecast, using fallback")
-        return "Sprawdź temperaturę w swojej dzielnicy na mapie. 🌡️"
+        return "Sprawdź temperaturę w swojej dzielnicy na mapie."
 
     times = hourly_data['times']
     temps = hourly_data['temps']
@@ -478,32 +478,32 @@ def generate_professional_forecast_text(hourly_data, mode):
 
     # === OPENING: Temperature trend ===
     if mode == "day":
-        intro = f"☀️ **Prognoza na dzień:**\n"
+        intro = f"Prognoza na dzień:\n"
     else:
-        intro = f"🌙 **Prognoza na noc:**\n"
+        intro = f"Prognoza na noc:\n"
     parts.append(intro)
 
     # Temperature narrative
     if trend['trend'] == "rising":
         if trend['change'] > 5:
-            temp_story = f"Temperatura będzie stopniowo rosnąć z {format_temp(trend['min_temp'])} " \
+            temp_story = f"📍 Temperatura będzie stopniowo rosnąć z {format_temp(trend['min_temp'])} " \
                         f"(ok. {trend['min_time']}) do {format_temp(trend['max_temp'])} " \
-                        f"(ok. {trend['max_time']}). 📈"
+                        f"(ok. {trend['max_time']})."
         else:
-            temp_story = f"Temperatura utrzyma się z tendencją wzrostową, " \
+            temp_story = f"📍 Temperatura utrzyma się z tendencją wzrostową, " \
                         f"osiągając maksymalnie {format_temp(trend['max_temp'])}."
 
     elif trend['trend'] == "falling":
         if trend['change'] < -5:
-            temp_story = f"Temperatura będzie stopniowo spadać z {format_temp(trend['max_temp'])} " \
-                        f"do {format_temp(trend['min_temp'])} pod koniec okresu prognozy. 📉"
+            temp_story = f"📍 Temperatura będzie stopniowo spadać z {format_temp(trend['max_temp'])} " \
+                        f"do {format_temp(trend['min_temp'])} pod koniec okresu prognozy."
         else:
-            temp_story = f"Temperatura będzie powoli spadać, " \
+            temp_story = f"📍 Temperatura będzie powoli spadać, " \
                         f"osiągając minimum {format_temp(trend['min_temp'])}."
 
     else:  # stable
         avg_temp = round(sum(temps) / len(temps))
-        temp_story = f"Temperatura utrzyma się na stałym poziomie około {format_temp(avg_temp)}."
+        temp_story = f"📍 Temperatura utrzyma się na stałym poziomie około {format_temp(avg_temp)}."
 
     parts.append(temp_story)
 
@@ -511,10 +511,10 @@ def generate_professional_forecast_text(hourly_data, mode):
     if trend['rapid_changes']:
         for time_str, change in trend['rapid_changes'][:1]:  # Only first front
             if change > 0:
-                front_story = f"\n⚠️ Około godz. {time_str} możliwy gwałtowny skok temperatury " \
+                front_story = f"\nOkoło godz. {time_str} możliwy gwałtowny skok temperatury " \
                              f"(+{abs(round(change))}°C) - przejście frontu ciepłego lub adwekcja ciepła."
             else:
-                front_story = f"\n⚠️ Około godz. {time_str} możliwy gwałtowny spadek temperatury " \
+                front_story = f"\nOkoło godz. {time_str} możliwy gwałtowny spadek temperatury " \
                              f"({round(change)}°C) - przejście frontu zimnego."
             parts.append(front_story)
 
@@ -524,19 +524,19 @@ def generate_professional_forecast_text(hourly_data, mode):
 
     # Determine sky description
     if avg_code <= 1:
-        sky_desc = "Bezchmurnie ☀️"
+        sky_desc = "Bezchmurnie"
     elif avg_code <= 3:
-        sky_desc = "Zachmurzenie umiarkowane ⛅"
+        sky_desc = "Zachmurzenie umiarkowane"
     elif avg_code in [45, 48]:
-        sky_desc = "Mgliście 🌫️"
+        sky_desc = "Mgliście"
     elif 51 <= avg_code <= 67:
-        sky_desc = "Pochmurno z opadami deszczu 🌧️"
+        sky_desc = "Pochmurno z opadami deszczu"
     elif 71 <= avg_code <= 86:
-        sky_desc = "Pochmurno z opadami śniegu ❄️"
+        sky_desc = "Pochmurno z opadami śniegu"
     elif avg_code >= 95:
-        sky_desc = "Burzowo ⛈️"
+        sky_desc = "Burzowo"
     else:
-        sky_desc = "Pochmurno ☁️"
+        sky_desc = "Pochmurno"
 
     # Precipitation narrative
     if max_precip > 70:
@@ -569,7 +569,7 @@ def generate_professional_forecast_text(hourly_data, mode):
 
         if max_wind > avg_wind + 15:
             wind_story = f"\nWiatr {wind_dir_name} {wind_strength}, " \
-                        f"średnio {avg_wind} km/h, w porywach do {max_wind} km/h. 💨"
+                        f"średnio {avg_wind} km/h, w porywach do {max_wind} km/h."
         elif avg_wind >= 20:
             wind_story = f"\nWiatr {wind_dir_name} {wind_strength}, około {avg_wind} km/h."
         elif avg_wind >= 10:
@@ -583,25 +583,22 @@ def generate_professional_forecast_text(hourly_data, mode):
     warnings = []
 
     if hazards['freezing_rain_risk']:
-        warnings.append("⚠️ **UWAGA**: Ryzyko marznącego deszczu - temperatura bliska 0°C przy opadach!")
+        warnings.append("UWAGA: Ryzyko marznącego deszczu - temperatura bliska 0°C przy opadach!")
 
     if hazards['snow_risk']:
-        warnings.append("❄️ **UWAGA**: Możliwe opady śniegu z akumulacją!")
+        warnings.append("UWAGA: Możliwe opady śniegu z akumulacją!")
 
     if hazards['fog_risk']:
-        warnings.append("🌫️ **UWAGA**: Gęsta mgła - ograniczona widoczność!")
+        warnings.append("UWAGA: Gęsta mgła - ograniczona widoczność!")
 
     if hazards['strong_wind_risk']:
-        warnings.append(f"💨 **UWAGA**: Silny wiatr do {round(hazards['max_wind'])} km/h!")
+        warnings.append(f"UWAGA: Silny wiatr do {round(hazards['max_wind'])} km/h!")
 
     if warnings:
         parts.append("\n\n" + "\n".join(warnings))
 
-    # === CHARITY PROMO ===
-    parts.append("\n\n❤️ Wesprzyj lokalną fundację. Przekaż 1.5% podatku. KRS: 0000498479")
-
     # === CLOSING ===
-    parts.append("\n\n📍 Szczegóły dla poszczególnych dzielnic na mapie poniżej.")
+    parts.append("\nSzczegóły dla poszczególnych dzielnic na mapie poniżej.")
 
     return "".join(parts)
 
@@ -2389,11 +2386,11 @@ def main():
                 forecast_text = generate_forecast_text(forecast)
                 logger.info("⚠️ Using simple fallback forecast")
             else:
-                forecast_text = "Sprawdź temperaturę w swojej dzielnicy na mapie. 🌡️"
+                forecast_text = "Sprawdź temperaturę w swojej dzielnicy na mapie."
                 logger.warning("⚠️ No forecast data available")
         except Exception as e:
             logger.error(f"❌ Forecast generation error: {e}")
-            forecast_text = "Sprawdź temperaturę w swojej dzielnicy na mapie. 🌡️"
+            forecast_text = "Sprawdź temperaturę w swojej dzielnicy na mapie."
 
         # 3. Get weather code for map selection (Boguszów-Gorce center - index 3)
         weather_code = districts_weather[3]['code'] if len(districts_weather) > 3 else 3
@@ -2419,11 +2416,13 @@ def main():
         else:
             range_str = f"od {format_temp(min_t)} do {format_temp(max_t)}"
 
-        caption = f"""🌡 Aktualna temperatura w Boguszowie-Gorcach: {range_str}. {desc}.
+        caption = f"""🌡️ Aktualna temperatura w Boguszowie-Gorcach: {range_str}. {desc}.
 {forecast_text}
 
-❤️ Wesprzyj lokalną fundację. Przekaż 1.5% podatku. KRS: 0000498479
-👉 Więcej: {FB_PROFILE_LINK}
+❤️ Mieszkańcu Boguszowa-Gorc — możesz wesprzeć lokalną fundację.
+👉 To nic Cię nie kosztuje. KRS: 0000498479
+
+Więcej: {FB_PROFILE_LINK}
 
 #BoguszówGorce #Boguszów #DolnyŚląsk"""
 
