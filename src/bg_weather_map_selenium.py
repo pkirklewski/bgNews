@@ -1741,8 +1741,9 @@ def get_latest_post_url(driver) -> str:
                         if 'kangurello' not in href and '100027689516729' not in href:
                             logger.debug(f"  Skipping foreign post: {href[:80]}")
                             continue
-                        # Clean up the URL
-                        if '?' in href:
+                        # Clean up tracking params, but keep essential query params
+                        # for permalink.php URLs (story_fbid/id are required)
+                        if '?' in href and 'permalink.php' not in href:
                             href = href.split('?')[0]
                         logger.info(f"✅ Found post URL: {href}")
                         return href
@@ -1936,7 +1937,10 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
                 share_btn = WebDriverWait(driver, 5).until(
                     EC.element_to_be_clickable((By.XPATH, selector))
                 )
-                share_btn.click()
+                try:
+                    share_btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", share_btn)
                 share_clicked = True
                 logger.info(f"  ✅ Clicked share button: {selector}")
                 human_delay(2, 3)
