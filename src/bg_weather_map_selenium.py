@@ -456,11 +456,11 @@ def generate_professional_forecast_text(hourly_data, mode):
         mode: "day" or "night"
 
     Returns:
-        str: Professional Polish forecast text with emojis and meteorological storytelling
+        tuple: (forecast_text, short_desc) - Professional Polish forecast text and short weather description
     """
     if not hourly_data or not hourly_data.get('temps'):
         logger.warning("⚠️ No hourly data for professional forecast, using fallback")
-        return "Sprawdź temperaturę w swojej dzielnicy na mapie."
+        return "Sprawdź temperaturę w swojej dzielnicy na mapie.", None
 
     times = hourly_data['times']
     temps = hourly_data['temps']
@@ -600,7 +600,22 @@ def generate_professional_forecast_text(hourly_data, mode):
     # === CLOSING ===
     parts.append("\nSzczegóły dla poszczególnych dzielnic na mapie poniżej.")
 
-    return "".join(parts)
+    # === SHORT DESCRIPTION for caption header ===
+    # Derived from the same forecast data to avoid contradicting the forecast body
+    if max_precip > 40 and avg_code >= 71:
+        short_desc = "Opady śniegu"
+    elif max_precip > 40 and avg_code >= 51:
+        short_desc = "Opady deszczu"
+    elif avg_code in [45, 48]:
+        short_desc = "Mgliście"
+    elif avg_code <= 1:
+        short_desc = "Pogodnie"
+    elif avg_code <= 3:
+        short_desc = "Pochmurno"
+    else:
+        short_desc = "Pochmurno"
+
+    return "".join(parts), short_desc
 
 
 # ============================================
@@ -2380,10 +2395,11 @@ def main():
 
         mode = forecast.get('forecast_mode', 'day') if forecast else 'day'
 
+        forecast_desc = None
         try:
             if forecast and forecast.get('hourly') and forecast['hourly'].get('temps'):
                 # Use professional forecast
-                forecast_text = generate_professional_forecast_text(forecast['hourly'], mode)
+                forecast_text, forecast_desc = generate_professional_forecast_text(forecast['hourly'], mode)
                 logger.info("✅ Using professional meteorological forecast")
             elif forecast:
                 # Fallback to simple forecast
@@ -2408,12 +2424,16 @@ def main():
             return
 
         # 5. Prepare caption
-        desc = "Pochmurno"
-        if weather_code in [0, 1]: desc = "Pogodnie"
-        elif weather_code in [2, 3]: desc = "Pochmurno"
-        elif weather_code in [45, 48]: desc = "Mgliście"
-        elif weather_code >= 51 and weather_code <= 67: desc = "Opady deszczu"
-        elif weather_code >= 71 and weather_code <= 86: desc = "Opady śniegu"
+        # Use forecast-based description if available, otherwise fall back to current weather code
+        if forecast_desc:
+            desc = forecast_desc
+        else:
+            desc = "Pochmurno"
+            if weather_code in [0, 1]: desc = "Pogodnie"
+            elif weather_code in [2, 3]: desc = "Pochmurno"
+            elif weather_code in [45, 48]: desc = "Mgliście"
+            elif weather_code >= 51 and weather_code <= 67: desc = "Opady deszczu"
+            elif weather_code >= 71 and weather_code <= 86: desc = "Opady śniegu"
 
         if min_t == max_t:
             range_str = format_temp(min_t)
