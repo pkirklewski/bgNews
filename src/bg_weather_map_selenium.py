@@ -1946,23 +1946,30 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
         ]
 
         share_clicked = False
-        for selector in share_selectors:
-            try:
-                logger.info(f"  🔍 Trying: {selector}")
-                share_btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
+        for attempt in range(3):
+            for selector in share_selectors:
                 try:
-                    share_btn.click()
-                except Exception:
-                    driver.execute_script("arguments[0].click();", share_btn)
-                share_clicked = True
-                logger.info(f"  ✅ Clicked share button: {selector}")
-                human_delay(2, 3)
+                    logger.info(f"  🔍 Trying: {selector}")
+                    share_btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                    try:
+                        share_btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", share_btn)
+                    share_clicked = True
+                    logger.info(f"  ✅ Clicked share button: {selector}")
+                    human_delay(2, 3)
+                    break
+                except Exception as e:
+                    logger.debug(f"  Share selector failed: {selector} - {e}")
+                    continue
+            if share_clicked:
                 break
-            except Exception as e:
-                logger.debug(f"  Share selector failed: {selector} - {e}")
-                continue
+            if attempt < 2:
+                logger.info(f"  🔍 [Step 2/6] Share button not found, scrolling down (attempt {attempt + 1}/3)...")
+                driver.execute_script("window.scrollBy(0, 400);")
+                human_delay(1, 2)
 
         if not share_clicked:
             logger.error("❌ [Step 2/6] Could not find Share button on post")
@@ -2197,7 +2204,7 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
             try:
                 logger.info(f"  🔍 Trying: {selector}")
                 publish_btn = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.XPATH, selector))
+                    EC.element_to_be_clickable((By.XPATH, selector))
                 )
                 # Use JavaScript click to avoid intercept issues
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", publish_btn)
@@ -2479,8 +2486,10 @@ Więcej: {FB_PROFILE_LINK}
                         logger.info(f"📤 Groups to share to: {len(SHARE_TO_GROUPS)}")
                         logger.info("=" * 60)
 
-                        # Get the URL of the post we just created
-                        post_url = get_latest_post_url(driver)
+                        # Use page URL directly for group sharing — the most recent post
+                        # in the feed will have the Share button. Resolving a specific post URL
+                        # is unreliable (picks up foreign page posts or broken permalinks).
+                        post_url = FB_PAGE_URL
                         logger.info(f"📍 Post URL for sharing: {post_url}")
 
                         # Prepare group share caption
