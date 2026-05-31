@@ -3,6 +3,7 @@ services:
     # Using version 131 - stable and well-tested
     image: selenium/standalone-chrome:131.0
     container_name: bg-selenium-chrome
+    hostname: bg-selenium-chrome
     shm_size: 4gb
     ports:
       - "4445:4444"      # Selenium WebDriver (offset from wchNews 4444)
