@@ -316,8 +316,8 @@ def get_temp_color(temp: float) -> tuple:
     elif temp < 0:  return (50, 150, 255)    # Blue (cold)
     elif temp < 15: return (50, 180, 255)    # Blue (cool)
     elif temp < 20: return (50, 205, 50)     # Green (mild)
-    elif temp < 25: return (255, 213, 3)     # Yellow #FFD503 (warm)
-    return (253, 171, 19)                    # Orange #FDAB13 (hot)
+    elif temp < 25: return (249, 166, 2)     # Gold Saffron #F9A602 (warm)
+    return (255, 140, 0)                     # Tangerine #FF8C00 (hot)
 
 # ============================================
 # TEMPERATURE FORMATTING HELPER
