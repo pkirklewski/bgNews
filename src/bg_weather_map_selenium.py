@@ -74,11 +74,46 @@ LOCK_FILE = PROJECT_ROOT / "locks" / "weather_map.lock"
 SHARE_TO_GROUPS_ENABLED = True
 SHARE_TO_GROUPS = [
     "BOGUSZÓW-GORCE",               # "BOGUSZÓW-GORCE/Ogłoszenia/Informacje/Sprzedam/Kupię/Zamienię/"
-    "Ogłoszenia Boguszów-Gorce",     # "Ogłoszenia Boguszów-Gorce"
-    "Społeczność Kuźnic",            # "Społeczność Kuźnic"
 ]
-SHARE_DELAY_SECONDS = 15  # Delay between group shares to avoid rate limiting
+SHARE_DELAY_MIN = 45   # Min delay between group shares (seconds)
+SHARE_DELAY_MAX = 120  # Max delay between group shares (seconds)
+MAX_GROUPS_PER_RUN = 5  # Max groups to share to per run (0 = unlimited)
 PERSONAL_PROFILE_NAME = "Piotr Kirklewski"
+
+# FAST_MODE — production capability for ad-hoc / emergency runs.
+# Activated via env var WMAP_FAST_MODE=1. When True:
+#   - human_delay() collapses to near-zero (skips anti-detection pauses
+#     between Selenium UI actions)
+#   - generate_map_image() reuses existing output PNG if it exists and
+#     is fresh enough (see FAST_MODE_REUSE_MAX_AGE_SEC) — skips re-fetch
+#     of all districts + IMGW + image rendering
+# DOES NOT shorten SHARE_DELAY_MIN/MAX (those are anti-spam, removing
+# them risks FB flagging the account).
+FAST_MODE = os.environ.get("WMAP_FAST_MODE", "0") == "1"
+FAST_MODE_REUSE_MAX_AGE_SEC = 3 * 3600  # reuse output PNG if <3 h old
+
+# ============================================
+# IMGW METEO WARNINGS (RCB-equivalent source)
+# ============================================
+# Powiat TERYT code(s) covering Boguszów-Gorce. Verified via Nominatim
+# reverse-geocode of all 7 DISTRICTS — all fall in powiat wałbrzyski (0221).
+IMGW_TERYT_CODES = ["0221"]
+IMGW_WARNINGS_URL = "https://danepubliczne.imgw.pl/api/data/warningsmeteo/teryt/{teryt}"
+
+# Banner colors by stopień (1=informacyjne, 2=ostrzeżenie, 3=alarm)
+WARNING_STOPIEN_COLOR = {
+    "1": (255, 213, 3),    # Yellow #FFD503 (matches our temp palette)
+    "2": (253, 171, 19),   # Orange #FDAB13 (matches our temp palette)
+    "3": (220, 50, 50),    # Red for danger
+}
+WARNING_EVENT_EMOJI = {
+    "Burze": "⛈", "Burze z gradem": "⛈", "Trąby powietrzne": "🌪",
+    "Upał": "🔥", "Mróz": "❄", "Silny mróz": "❄",
+    "Silny wiatr": "🌬", "Wiatr": "🌬",
+    "Intensywne opady deszczu": "🌧", "Opady deszczu": "🌧",
+    "Intensywne opady śniegu": "❄", "Opady śniegu": "❄",
+    "Mgła": "🌫", "Oblodzenie": "🧊", "Roztopy": "💧",
+}
 
 # ============================================
 # CHARITY OVERLAY CONFIGURATION
@@ -197,7 +232,17 @@ DISTRICTS = [
 # ============================================
 
 def human_delay(min_sec: float = 0.5, max_sec: float = 2.0):
-    """Random delay to mimic human behavior"""
+    """Random delay to mimic human behavior.
+
+    In FAST_MODE, uses a small fixed delay (~0.3 s) instead of the random
+    0.5-2 s. Trade-off: still ~5x faster than baseline, but enough for FB's
+    React-driven UI to finish rendering before the next Selenium click —
+    a tighter 0.05 s caused "element click intercepted by other element"
+    errors during caption entry in early FAST_MODE testing.
+    """
+    if FAST_MODE:
+        time.sleep(0.3)
+        return
     time.sleep(random.uniform(min_sec, max_sec))
 
 def human_type(element, text: str, min_delay: float = 0.03, max_delay: float = 0.12):
@@ -841,6 +886,133 @@ def fetch_forecast_center() -> dict:
     logger.info(f"✅ Forecast ({mode}): {len(hourly_forecast['temps'])} hourly points collected")
     return result
 
+
+# ============================================
+# IMGW WARNINGS FETCH & RENDER
+# ============================================
+
+def fetch_imgw_warnings(teryt_codes: list) -> list:
+    """Fetch active IMGW meteo warnings for one or more powiat TERYT codes.
+
+    Returns deduplicated list (by warning id), filtered to warnings whose
+    `obowiazuje_do` is still in the future, sorted by stopień DESC then start.
+    Empty list on any failure — we never want to block map publishing on this.
+    """
+    seen_ids = set()
+    raw = []
+    for code in teryt_codes:
+        try:
+            r = requests.get(IMGW_WARNINGS_URL.format(teryt=code), timeout=8)
+            if not r.ok:
+                logger.warning(f"⚠️ IMGW HTTP {r.status_code} for teryt={code}")
+                continue
+            data = r.json()
+            if not isinstance(data, list):
+                continue
+            for w in data:
+                wid = w.get('id')
+                if wid in seen_ids:
+                    continue
+                seen_ids.add(wid)
+                raw.append(w)
+        except Exception as e:
+            logger.warning(f"⚠️ IMGW fetch failed for teryt={code}: {e}")
+
+    now = datetime.now()
+    active = []
+    for w in raw:
+        try:
+            d_to = datetime.strptime(w['obowiazuje_do'], "%Y-%m-%d %H:%M:%S")
+            if d_to >= now:
+                active.append(w)
+        except Exception:
+            active.append(w)  # if parse fails, include defensively
+    active.sort(key=lambda w: (-int(w.get('stopien', 0) or 0), w.get('obowiazuje_od', '')))
+    logger.info(f"🚨 IMGW warnings active for {teryt_codes}: {len(active)} "
+                f"({[w.get('nazwa_zdarzenia') + ' st.' + str(w.get('stopien')) for w in active]})")
+    return active
+
+
+def draw_warnings_banner(image_path: str, warnings: list) -> str:
+    """Add a colored warning banner to the top of the map image.
+
+    Mutates the file at `image_path` in place. Returns the same path.
+    No-op (and no file change) if `warnings` is empty.
+    Banner color = highest stopień among active warnings.
+    """
+    if not warnings:
+        return image_path
+    try:
+        img = Image.open(image_path).convert('RGBA')
+        w, h = img.size
+
+        max_stopien = max((int(x.get('stopien', 1) or 1) for x in warnings), default=2)
+        bg_color = WARNING_STOPIEN_COLOR.get(str(max_stopien), (253, 171, 19))
+
+        # Banner height: ~9% of map height, clamped sensibly
+        banner_h = max(120, min(180, int(h * 0.09)))
+
+        # Compose: banner on top, original map below
+        new_img = Image.new('RGBA', (w, h + banner_h), bg_color + (255,))
+        new_img.paste(img, (0, banner_h))
+        draw = ImageDraw.Draw(new_img)
+
+        title_font = get_font(42, bold=True)
+        line_font = get_font(26, bold=True)
+        small_font = get_font(20, bold=True)
+
+        title = "⚠ OSTRZEŻENIE METEO IMGW"
+        draw.text((20, 12), title, font=title_font, fill=(0, 0, 0))
+
+        # Up to 2 warning lines (most severe first)
+        y = 62
+        for wd in warnings[:2]:
+            name = wd.get('nazwa_zdarzenia', '?')
+            st = wd.get('stopien', '?')
+            emoji = WARNING_EVENT_EMOJI.get(name, "⚠")
+            d_from = (wd.get('obowiazuje_od', '') or '')[5:16]  # "MM-DD HH:MM"
+            d_to = (wd.get('obowiazuje_do', '') or '')[5:16]
+            line = f"{emoji} {name} (stopień {st})   {d_from} → {d_to}"
+            draw.text((20, y), line, font=line_font, fill=(0, 0, 0))
+            y += 30
+
+        # Source line bottom-right of banner
+        src = "Źródło: IMGW-PIB"
+        bbox = draw.textbbox((0, 0), src, font=small_font)
+        sw = bbox[2] - bbox[0]
+        draw.text((w - sw - 20, banner_h - 28), src, font=small_font, fill=(0, 0, 0))
+
+        new_img.save(image_path, 'PNG')
+        logger.info(f"✅ Warning banner added to {image_path} ({banner_h}px, color stopień {max_stopien})")
+        return image_path
+    except Exception as e:
+        logger.error(f"❌ Could not draw warnings banner: {e}")
+        return image_path
+
+
+def format_warnings_for_caption(warnings: list) -> str:
+    """Format warnings as a caption header. Returns '' if no warnings."""
+    if not warnings:
+        return ""
+    lines = ["⚠️ OSTRZEŻENIE METEO IMGW:"]
+    for wd in warnings:
+        name = wd.get('nazwa_zdarzenia', '?')
+        st = wd.get('stopien', '?')
+        prob = wd.get('prawdopodobienstwo', '')
+        d_from = wd.get('obowiazuje_od', '')
+        d_to = wd.get('obowiazuje_do', '')
+        emoji = WARNING_EVENT_EMOJI.get(name, "⚠")
+        prob_str = f", prawdopodobieństwo {prob}%" if prob else ""
+        lines.append(f"{emoji} {name} — stopień {st}{prob_str}")
+        lines.append(f"   Obowiązuje: {d_from} → {d_to}")
+        tresc = (wd.get('tresc') or '').strip()
+        if tresc:
+            # Trim to keep caption manageable
+            snippet = tresc[:260] + ("…" if len(tresc) > 260 else "")
+            lines.append(f"   {snippet}")
+    return "\n".join(lines)
+
+
 def generate_forecast_text(forecast: dict) -> str:
     """Generate forecast text with temperature, conditions and wind info (legacy fallback)"""
 
@@ -1343,7 +1515,127 @@ def ensure_logged_in_as_page(driver):
     return True
 
 
-def post_to_facebook_selenium(driver, image_path: str, caption: str, test_mode: bool = False) -> bool:
+def _derive_verification_needle(caption: str) -> str:
+    """Pick a distinctive ~30-50 char substring from caption to verify a post
+    is actually rendered on the page after publish.
+
+    Prefers the 'Aktualna temperatura' line (freshly generated each run with
+    current temp range — almost never collides with older posts). Falls back
+    to first substantive prose line, then to first 50 chars.
+
+    Callers should prefer passing an explicit verify_needle to
+    post_to_facebook_selenium when they have unique-per-run data that's
+    guaranteed to render ABOVE FB's "... Wyświetl więcej" caption truncation
+    point (≈ first 80-100 chars).
+    """
+    for line in caption.split('\n'):
+        s = line.strip()
+        if 'Aktualna temperatura' in s:
+            return s.lstrip('🌡️ ').strip()[:60]
+    SKIP_LEADS = ('•', '#', '📍', 'Więcej:', 'KRS:')
+    SKIP_EMOJI_PREFIX = '⚠️🌡️❤️👉🚨📍'
+    for line in caption.split('\n'):
+        s = line.strip()
+        if not s or any(s.startswith(lead) for lead in SKIP_LEADS):
+            continue
+        for ch in list(SKIP_EMOJI_PREFIX):
+            if s.startswith(ch):
+                s = s[len(ch):].lstrip()
+        if 25 <= len(s) <= 80 and any(c.isalpha() for c in s):
+            return s[:50]
+    return caption.replace('\n', ' ').strip()[:50]
+
+
+def verify_post_published_and_get_url(driver, verify_needle: str,
+                                       timeout: int = 15) -> str:
+    """STRICT post-publish verification.
+
+    Navigates to FB_PAGE_URL and looks for verify_needle in the rendered DOM.
+    If found, extracts the specific post's permalink URL. Two layout modes
+    are supported:
+
+    (1) Public view → direct /posts/<id> or /permalink/ anchors
+    (2) Page-admin view (logged in as page) → no direct permalink anchors;
+        reconstruct facebook.com/<page_id>/posts/<post_id> from the
+        target_id + page_id query params of the boost-post URL that admin
+        view DOES render on each post.
+
+    Returns the post URL string on success, None on failure. Callers MUST
+    treat None as "publish actually failed" and skip downstream sharing —
+    falling back to FB_PAGE_URL is the historical 2026-06-20 bug that
+    caused 5 wch groups to receive an unrelated TVWALBRZYCH 'Riese'
+    article reshare with our IMGW alert caption attached.
+    """
+    try:
+        logger.info(f"🔎 Verifying post on page — needle: {verify_needle!r}")
+        driver.get(FB_PAGE_URL)
+        human_delay(4, 6)
+
+        if "'" in verify_needle and '"' in verify_needle:
+            logger.warning("⚠️ Needle contains both quote types — using partial match")
+            verify_needle = verify_needle.replace("'", " ").replace('"', ' ')
+        xpath_lit = f'"{verify_needle}"' if "'" in verify_needle else f"'{verify_needle}'"
+
+        try:
+            needle_el = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, f"//*[contains(text(), {xpath_lit})]")
+                )
+            )
+            logger.info("✅ Needle found on page")
+        except TimeoutException:
+            logger.error(f"❌ Post verification FAILED — needle {verify_needle!r} "
+                         f"not present on page within {timeout}s after publish.")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_needle_missing.png"))
+            return None
+
+        import re
+        TARGET_ID_RE = re.compile(r'[?&]target_id=(\d+)')
+        PAGE_ID_RE = re.compile(r'[?&]page_id=(\d+)')
+
+        for levels in range(1, 16):
+            try:
+                xpath_up = "./" + ("../" * levels) + "."
+                ancestor = needle_el.find_element(By.XPATH, xpath_up)
+                all_links = ancestor.find_elements(By.XPATH, ".//a[@href]")
+                for link in all_links:
+                    href = link.get_attribute('href') or ''
+                    if any(skip in href for skip in ('comment_id', 'notif_id', '/groups/',
+                                                     '/ad_center/', '/photo/')):
+                        continue
+                    if any(k in href for k in ('/posts/', '/permalink/', 'permalink.php')):
+                        clean_url = href.split('&__tn__')[0].split('&__cft__')[0]
+                        logger.info(f"✅ Post permalink extracted (direct): {clean_url}")
+                        return clean_url
+                target_id = page_id = None
+                for link in all_links:
+                    href = link.get_attribute('href') or ''
+                    if '/ad_center/' in href and 'target_id=' in href:
+                        m_t = TARGET_ID_RE.search(href)
+                        m_p = PAGE_ID_RE.search(href)
+                        if m_t and m_p:
+                            target_id, page_id = m_t.group(1), m_p.group(1)
+                            break
+                if target_id and page_id:
+                    reconstructed = f"https://www.facebook.com/{page_id}/posts/{target_id}"
+                    logger.info(f"✅ Post permalink reconstructed from admin-view IDs: {reconstructed}")
+                    return reconstructed
+            except Exception:
+                continue
+
+        logger.error("❌ Needle found but no permalink derivable. "
+                     "Refusing to share to avoid wrong-post fallback.")
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_no_permalink.png"))
+        return None
+    except Exception as e:
+        logger.error(f"❌ verify_post_published_and_get_url crashed: {e}")
+        import traceback; traceback.print_exc()
+        return None
+
+
+def post_to_facebook_selenium(driver, image_path: str, caption: str,
+                               verify_needle: str = None,
+                               test_mode: bool = False) -> tuple:
     """Post image with caption to Facebook using Selenium
 
     Args:
@@ -1625,7 +1917,7 @@ def post_to_facebook_selenium(driver, image_path: str, caption: str, test_mode: 
                 logger.info(f"📸 Screenshot saved: {PROJECT_ROOT / 'debug' / 'debug_test_mode_ready.png'}")
                 logger.info("🧪 Pipeline test PASSED - all steps completed successfully!")
                 logger.info("=" * 60)
-                return True
+                return True, None
 
             # ============================================
             # PRODUCTION MODE: Actually publish
@@ -1637,9 +1929,17 @@ def post_to_facebook_selenium(driver, image_path: str, caption: str, test_mode: 
 
             human_delay(2, 3)
 
-            # Handle "Rozmawiaj bezpośrednio z ludźmi" popup - click "Nie teraz"
+            # Handle FB post-publish upsell dialogs. Critical: FB sometimes
+            # intercepts the publish click with a "Organizujesz wydarzenie?"
+            # promotion dialog whose [Opublikuj oryginalny post] button is the
+            # one that actually publishes. Without dismissing it, the post
+            # stays in limbo (NOT on the page feed). Always try the publish-
+            # original dismiss FIRST, then fall back to "Not now"-style buttons.
             popup_handled = False
             popup_selectors = [
+                "//span[text()='Opublikuj oryginalny post']",
+                "//div[@role='button']//span[text()='Opublikuj oryginalny post']",
+                "//span[text()='Publish original post']",
                 "//span[text()='Nie teraz']",
                 "//div[@role='button']//span[text()='Nie teraz']",
                 "//span[text()='Not Now']",
@@ -1686,28 +1986,34 @@ def post_to_facebook_selenium(driver, image_path: str, caption: str, test_mode: 
             driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_after_publish.png"))
 
             human_delay(2, 3)
-            driver.refresh()
-            human_delay(3, 4)
 
-            try:
-                post_indicator = driver.find_element(By.XPATH, "//div[contains(text(), 'Aktualna temperatura')]")
-                logger.info("✅ Post verified on page!")
-            except:
-                logger.warning("⚠️ Could not verify post on page - check manually")
+            # STRICT verification — see wch 2026-06-20 incident notes. If we
+            # log success without confirming the post is actually rendered
+            # on the page, downstream share_to_all_groups will use FB_PAGE_URL
+            # which renders the page-admin view and clicks "Udostępnij" on
+            # an arbitrary widget-panel post → wrong content propagated to N
+            # groups. Refuse to report success unless we find a unique needle
+            # AND extract the specific post permalink.
+            needle = verify_needle or _derive_verification_needle(caption)
+            post_url = verify_post_published_and_get_url(driver, needle)
+            if not post_url:
+                logger.error("❌ Post NOT verified on page — refusing to report success "
+                             "to prevent downstream wrong-post sharing.")
+                return False, None
 
-            logger.info("✅ Post published successfully!")
-            return True
+            logger.info(f"✅ Post published AND verified on page!  URL: {post_url}")
+            return True, post_url
         else:
             logger.error("❌ Could not find publish button")
             driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_no_publish.png"))
-            return False
+            return False, None
 
     except Exception as e:
         logger.error(f"❌ Selenium error: {e}")
         import traceback
         traceback.print_exc()
         driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_error.png"))
-        return False
+        return False, None
 
 
 # ============================================
@@ -1901,6 +2207,30 @@ def switch_to_personal_profile(driver) -> bool:
         driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_group_share_error_switch.png"))
         logger.error("📸 Screenshot saved: debug_group_share_error_switch.png")
         return False
+
+
+def close_share_dialog(driver):
+    """Attempt to close any open share dialog after a failed/rate-limited share."""
+    try:
+        close_btns = driver.find_elements(By.XPATH, "//div[@role='dialog']//div[@aria-label='Zamknij' or @aria-label='Close']")
+        for btn in close_btns:
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+                logger.info("🧹 Closed open share dialog")
+                human_delay(0.5, 1)
+                return
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Fallback: press Escape
+    try:
+        from selenium.webdriver.common.keys import Keys
+        driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
+        human_delay(0.5, 1)
+        logger.info("🧹 Pressed Escape to close dialog")
+    except Exception:
+        pass
 
 
 def share_post_to_group(driver, post_url: str, group_search_name: str, caption: str) -> bool:
@@ -2186,6 +2516,27 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
         driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_06_before_publish.png"))
         logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_06_before_publish.png")
 
+        # DEFENSE IN DEPTH: verify the share dialog actually contains an embed
+        # of OUR page's post. We detect this by looking for FB_PAGE_NAME in the
+        # dialog text — that name is rendered by the embed-card (page that
+        # authored the original post) but NOT present in our typed caption
+        # (the caption uses FB_PROFILE_LINK URL only). If FB_PAGE_NAME is
+        # missing, this dialog is sharing somebody else's post — abort.
+        try:
+            dialog_el = driver.find_element(By.XPATH, "//div[@role='dialog']")
+            dialog_text = dialog_el.text or ""
+            if FB_PAGE_NAME not in dialog_text:
+                logger.error(f"❌ PRE-PUBLISH GUARD: share dialog does NOT contain "
+                             f"'{FB_PAGE_NAME}' — embed is from a different page. "
+                             f"Aborting share to {group_search_name} to prevent "
+                             f"wrong-content propagation (wch 2026-06-20 bug).")
+                driver.save_screenshot(str(PROJECT_ROOT / "debug" /
+                    f"debug_share_{safe_group_name}_WRONG_EMBED_ABORTED.png"))
+                return False
+            logger.info(f"✅ Pre-publish guard passed: embed is from '{FB_PAGE_NAME}'")
+        except Exception as e:
+            logger.warning(f"⚠️ Pre-publish guard could not inspect dialog ({e}); proceeding")
+
         # --- Step 6: Click "Udostępnij" / "Opublikuj" / "Post" ---
         logger.info(f"🔍 [Step 6/6] Looking for Publish/Share button...")
         publish_selectors = [
@@ -2235,12 +2586,35 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
             driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_no_publish.png"))
             return False
 
-        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_07_after_publish.png"))
-        logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_07_after_publish.png")
-
-        logger.info(f"✅ Successfully shared to group: {group_search_name}")
-        logger.info("=" * 50)
-        return True
+        # --- Verify share completed: wait for dialog to disappear ---
+        logger.info(f"  ⏳ Waiting for share dialog to close (confirming share)...")
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.invisibility_of_element_located((By.XPATH, "//div[@role='dialog']//div[@aria-label='Utwórz post']"))
+            )
+            # Dialog gone = share completed
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_07_after_publish.png"))
+            logger.info(f"📸 Screenshot: debug_share_{safe_group_name}_07_after_publish.png")
+            logger.info(f"✅ Share dialog closed — share confirmed for: {group_search_name}")
+            logger.info("=" * 50)
+            return True
+        except TimeoutException:
+            # Dialog still open after 15s = rate-limited or error
+            logger.warning(f"⚠️ Share dialog still open after publish — possible rate limit for: {group_search_name}")
+            # Check for error/rate-limit text in dialog
+            try:
+                error_texts = driver.find_elements(By.XPATH,
+                    "//div[@role='dialog']//*[contains(text(), 'limit') or contains(text(), 'błąd') or contains(text(), 'error') or contains(text(), 'spróbuj') or contains(text(), 'try again')]")
+                if error_texts:
+                    for et in error_texts[:3]:
+                        if et.text.strip():
+                            logger.error(f"  🚫 Rate limit text found: '{et.text.strip()}'")
+            except Exception:
+                pass
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_share_{safe_group_name}_error_rate_limit.png"))
+            logger.error(f"📸 Screenshot: debug_share_{safe_group_name}_error_rate_limit.png")
+            close_share_dialog(driver)
+            return False
 
     except Exception as e:
         logger.error(f"❌ Error sharing to group '{group_search_name}': {e}")
@@ -2251,30 +2625,12 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
             logger.error(f"📸 Screenshot: debug_share_{safe_group_name}_error_exception.png")
         except Exception:
             logger.error("❌ Could not save error screenshot")
-        # Try to close any open dialogs to clean up for next group
-        try:
-            close_btns = driver.find_elements(By.XPATH, "//div[@role='dialog']//div[@aria-label='Zamknij' or @aria-label='Close']")
-            for btn in close_btns:
-                try:
-                    driver.execute_script("arguments[0].click();", btn)
-                    logger.info("🧹 Closed open dialog after error")
-                    human_delay(0.5, 1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        # Press Escape as a final fallback to close dialogs
-        try:
-            from selenium.webdriver.common.keys import Keys
-            driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ESCAPE)
-            human_delay(0.5, 1)
-            logger.info("🧹 Pressed Escape to close any remaining dialogs")
-        except Exception:
-            pass
+        close_share_dialog(driver)
         return False
 
 
-def share_to_all_groups(driver, post_url: str, caption: str) -> int:
+def share_to_all_groups(driver, post_url: str, caption: str,
+                         max_groups: int = None) -> int:
     """Share post to all configured Facebook groups.
 
     Switches to personal profile first (group sharing must be done as personal account),
@@ -2282,8 +2638,14 @@ def share_to_all_groups(driver, post_url: str, caption: str) -> int:
 
     Args:
         driver: Selenium WebDriver instance
-        post_url: URL of the post to share
+        post_url: URL of the post to share. MUST be a specific post permalink —
+                  never FB_PAGE_URL (the page profile). See wch 2026-06-20
+                  incident: when post_url was FB_PAGE_URL, the page-admin
+                  view's first "Udostępnij" attached to a TVWALBRZYCH 'Riese'
+                  article instead of our just-published map.
         caption: Caption text for shared posts
+        max_groups: Optional override for MAX_GROUPS_PER_RUN. Used in RCB
+                    alert mode to push the post to a larger audience.
 
     Returns:
         Number of successful shares (0 to len(SHARE_TO_GROUPS)).
@@ -2296,12 +2658,34 @@ def share_to_all_groups(driver, post_url: str, caption: str) -> int:
         logger.info("ℹ️ No groups configured for sharing (SHARE_TO_GROUPS is empty)")
         return 0
 
+    # Guard: post_url MUST be a specific permalink. See docstring rationale.
+    if not post_url:
+        logger.error("❌ share_to_all_groups: post_url is empty — refusing to share. "
+                     "Caller must pass the specific post permalink from "
+                     "post_to_facebook_selenium return tuple.")
+        return 0
+    if post_url.rstrip('/') == FB_PAGE_URL.rstrip('/'):
+        logger.error(f"❌ share_to_all_groups: post_url equals FB_PAGE_URL ({post_url}) — "
+                     "this is the page profile, not a specific post. Refusing "
+                     "to share (this is the wch 2026-06-20 bug).")
+        return 0
+
+    groups = list(SHARE_TO_GROUPS)
+
+    # Apply max groups per run limit
+    effective_max = max_groups if max_groups is not None else MAX_GROUPS_PER_RUN
+    if max_groups is not None and max_groups != MAX_GROUPS_PER_RUN:
+        logger.info(f"📣 max_groups override active: {max_groups} (default {MAX_GROUPS_PER_RUN})")
+    if effective_max > 0 and len(groups) > effective_max:
+        logger.info(f"📋 Limiting to {effective_max}/{len(groups)} groups this run")
+        groups = groups[:effective_max]
+
     logger.info("=" * 60)
-    logger.info(f"📤 STARTING GROUP SHARING: {len(SHARE_TO_GROUPS)} groups configured")
-    for i, name in enumerate(SHARE_TO_GROUPS):
+    logger.info(f"📤 STARTING GROUP SHARING: {len(groups)} groups")
+    for i, name in enumerate(groups):
         logger.info(f"  {i+1}. {name}")
     logger.info(f"📍 Post URL: {post_url}")
-    logger.info(f"⏱️ Delay between shares: {SHARE_DELAY_SECONDS}s (+0-5s random)")
+    logger.info(f"⏱️ Delay between shares: {SHARE_DELAY_MIN}-{SHARE_DELAY_MAX}s (randomized)")
     logger.info("=" * 60)
 
     # First switch to personal profile (required for group sharing)
@@ -2313,30 +2697,42 @@ def share_to_all_groups(driver, post_url: str, caption: str) -> int:
 
     successful_shares = 0
     failed_groups = []
+    skipped_groups = []
+    consecutive_failures = 0
+    CONSECUTIVE_FAIL_LIMIT = 3
 
-    for i, group_name in enumerate(SHARE_TO_GROUPS):
-        logger.info(f"--- Group {i+1}/{len(SHARE_TO_GROUPS)}: {group_name} ---")
+    for i, group_name in enumerate(groups):
+        logger.info(f"--- Group {i+1}/{len(groups)}: {group_name} ---")
 
         if share_post_to_group(driver, post_url, group_name, caption):
             successful_shares += 1
-            logger.info(f"✅ [{i+1}/{len(SHARE_TO_GROUPS)}] Shared to: {group_name}")
+            consecutive_failures = 0
+            logger.info(f"✅ [{i+1}/{len(groups)}] Shared to: {group_name}")
         else:
             failed_groups.append(group_name)
-            logger.error(f"❌ [{i+1}/{len(SHARE_TO_GROUPS)}] Failed to share to: {group_name}")
+            consecutive_failures += 1
+            logger.error(f"❌ [{i+1}/{len(groups)}] Failed to share to: {group_name}")
+            if consecutive_failures >= CONSECUTIVE_FAIL_LIMIT:
+                remaining = len(groups) - i - 1
+                skipped_groups = groups[i+1:]
+                logger.error(f"🚫 RATE LIMIT: {CONSECUTIVE_FAIL_LIMIT} consecutive failures — stopping. {remaining} groups skipped.")
+                break
 
         # Delay between shares (except for last one)
-        if i < len(SHARE_TO_GROUPS) - 1:
-            delay = SHARE_DELAY_SECONDS + random.uniform(0, 5)
+        if i < len(groups) - 1:
+            delay = random.uniform(SHARE_DELAY_MIN, SHARE_DELAY_MAX)
             logger.info(f"⏳ Waiting {delay:.0f}s before next group share...")
             time.sleep(delay)
 
     logger.info("=" * 60)
     logger.info(f"📊 GROUP SHARING SUMMARY:")
-    logger.info(f"  Total groups: {len(SHARE_TO_GROUPS)}")
+    logger.info(f"  Total groups: {len(groups)}")
     logger.info(f"  Successful: {successful_shares}")
     logger.info(f"  Failed: {len(failed_groups)}")
     if failed_groups:
         logger.info(f"  Failed groups: {failed_groups}")
+    if skipped_groups:
+        logger.info(f"  Skipped (rate limit): {len(skipped_groups)} — {skipped_groups}")
     logger.info("=" * 60)
 
     return successful_shares
