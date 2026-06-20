@@ -50,12 +50,40 @@ DEBUG_DIR = PROJECT_ROOT / "debug"
 FB_PAGE_URL = "https://www.facebook.com/profile.php?id=100027689516729"
 FB_PAGE_NAME = "Boguszow-Gorce Newsy i Informacje"
 
-# Facebook pages to monitor for new posts
+# Facebook pages to monitor for new posts.
+# Mix of /handle URLs and /profile.php?id=... URLs (the latter for "new
+# pages experience" professional accounts that don't expose a vanity
+# handle). Playwright unauthenticated scraping works for both — public
+# posts only.
+#
+# IMPORTANT: this list controls inbound aggregation (we read FROM these,
+# repost ON our page). It is DISTINCT from RCB_ALERT_EXTRA_PROFILE_POSTS
+# in bg_weather_map_selenium.py (which controls outbound alert
+# distribution TO designated profiles).
 MONITORED_PAGES = [
-    {"name": "Gmina Miasto Boguszow-Gorce", "url": "https://www.facebook.com/gminamiastoboguszowgorce"},
-    {"name": "Gornik Boguszow-Gorce",       "url": "https://www.facebook.com/GornikBoguszowGorce"},
-    {"name": "MBPCK",                        "url": "https://www.facebook.com/MBPCK"},
-    {"name": "OSP Boguszow",                 "url": "https://www.facebook.com/ospboguszow"},
+    # --- Municipal / official ---
+    {"name": "Gmina Miasto Boguszow-Gorce",       "url": "https://www.facebook.com/gminamiastoboguszowgorce"},
+    {"name": "Burmistrz Daniel Lubinski",         "url": "https://www.facebook.com/profile.php?id=61583693225846"},
+    {"name": "Straz Miejska Boguszow-Gorce",      "url": "https://www.facebook.com/profile.php?id=100065918171599"},
+    {"name": "OSP Boguszow",                       "url": "https://www.facebook.com/ospboguszow"},
+    # --- Culture / education ---
+    {"name": "MBPCK (biblioteka + centrum kultury)", "url": "https://www.facebook.com/MBPCK"},
+    {"name": "Zespol Szkolno-Przedszkolny",       "url": "https://www.facebook.com/profile.php?id=100063549236963"},
+    # --- Sport / recreation ---
+    {"name": "OSiR Boguszow-Gorce",                "url": "https://www.facebook.com/osirbg"},
+    {"name": "Gornik Boguszow-Gorce",              "url": "https://www.facebook.com/GornikBoguszowGorce"},
+    {"name": "HEROS Boguszow-Gorce (zapasy)",      "url": "https://www.facebook.com/zapasyheros"},
+    {"name": "Stajnia Boguszow",                   "url": "https://www.facebook.com/stajniaboguszow"},
+    # --- Local establishments ---
+    {"name": "Stodola Dzika",                      "url": "https://www.facebook.com/StodolaDzika"},
+    # --- Religious communities ---
+    {"name": "Kosciol Uliczny Boguszow-Gorce",     "url": "https://www.facebook.com/profile.php?id=100067837419514"},
+    # --- TODO: GROUP-type sources need a separate scraper code path
+    #     (FB groups require authentication and use different DOM markers).
+    #     Pending: Kosciol Zielonoswiatkowy Boguszow-Gorce —
+    #     https://www.facebook.com/groups/799540943412790 ("nasza grupa")
+    # --- TODO: WEBSITE sources (non-FB) handled by bg_scraper_selenium.py
+    #     extension. Pending: https://bip.boguszow-gorce.pl/ (BIP)
 ]
 
 # Delays between shares (seconds)
