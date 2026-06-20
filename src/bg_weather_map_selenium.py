@@ -80,6 +80,32 @@ SHARE_DELAY_MAX = 120  # Max delay between group shares (seconds)
 MAX_GROUPS_PER_RUN = 5  # Max groups to share to per run (0 = unlimited)
 PERSONAL_PROFILE_NAME = "Piotr Kirklewski"
 
+# ============================================
+# RCB ALERT — EXTRA PROFILE-WALL DISTRIBUTION
+# ============================================
+# Profiles/professional-accounts that should receive the IMGW alert post
+# pasted onto their wall via "Napisz coś do <name>..." textbox.
+#
+# ⚠️ ALERT-ONLY — these profiles MUST NEVER receive regular daily weather
+# or city-news posts. Local services (e.g. Straż Miejska) have agreed to
+# host alert notifications but would BAN US for spam if we posted daily
+# content there.
+#
+# Safety architecture:
+#   - This list is consumed ONLY by post_alert_to_profile_wall() which
+#     enforces an `is_alert=True` guard parameter.
+#   - The regular share_to_all_groups() pipeline reads ONLY from
+#     SHARE_TO_GROUPS and never sees this list.
+#   - bg's main() (regular daily cron) does NOT iterate this list.
+#   - When alert-mode publishing is added to main(), the alert path
+#     must call post_alert_to_profile_wall(..., is_alert=True)
+#     explicitly for each entry here.
+RCB_ALERT_EXTRA_PROFILE_POSTS = [
+    # Straż Miejska Boguszów-Gorce — public service profile, asked to
+    # receive RCB-class meteo alerts (storms, heat, frost, etc.).
+    "https://www.facebook.com/profile.php?id=100065918171599",
+]
+
 # FAST_MODE — production capability for ad-hoc / emergency runs.
 # Activated via env var WMAP_FAST_MODE=1. When True:
 #   - human_delay() collapses to near-zero (skips anti-detection pauses
@@ -2537,14 +2563,26 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
         except Exception as e:
             logger.warning(f"⚠️ Pre-publish guard could not inspect dialog ({e}); proceeding")
 
-        # --- Step 6: Click "Udostępnij" / "Opublikuj" / "Post" ---
+        # --- Step 6: Click submit button (FB share-to-group dialog uses
+        #     "Opublikuj" as the main blue submit button at the bottom).
+        #     IMPORTANT: try "Opublikuj" FIRST. Previously this list led with
+        #     "Udostępnij" inside an obfuscated x1qjc9v5 class — that matched
+        #     a SECONDARY share-count link on the embedded post preview, not
+        #     the real submit button. Result: click went through (script
+        #     logged success), but no actual share was published.
+        #     (Verified 2026-06-20: bg group "BOGUSZÓW-GORCE" did NOT receive
+        #     the alert share even though guards passed, until this fix.)
         logger.info(f"🔍 [Step 6/6] Looking for Publish/Share button...")
         publish_selectors = [
-            # The share dialog uses "Udostępnij" (Share) button, not "Opublikuj" (Publish)
+            "//div[@role='dialog']//div[@role='button']//span[text()='Opublikuj']",
+            "//div[@role='dialog']//span[text()='Opublikuj']",
+            "//div[@aria-label='Opublikuj' and @role='button']",
+            "//div[@role='dialog']//div[@role='button']//span[text()='Post']",
+            "//div[@role='dialog']//span[text()='Post']",
+            # Last resort — the older "Udostępnij" fallbacks (kept for older
+            # group dialog variants that submit with this text):
             "//div[@role='dialog']//div[@aria-label='Utwórz post']//span[text()='Udostępnij']",
             "//div[@role='dialog']//span[text()='Udostępnij'][ancestor::div[contains(@class, 'x1qjc9v5')]]",
-            "//div[@role='dialog']//span[text()='Opublikuj']",
-            "//div[@role='dialog']//span[text()='Post']",
             "//div[@role='dialog']//span[text()='Share']",
             "//div[@aria-label='Opublikuj']",
             "//div[@aria-label='Post']",
@@ -2626,6 +2664,155 @@ def share_post_to_group(driver, post_url: str, group_search_name: str, caption: 
         except Exception:
             logger.error("❌ Could not save error screenshot")
         close_share_dialog(driver)
+        return False
+
+
+# ============================================
+# RCB ALERT — POST TO PROFILE WALL
+# ============================================
+
+def post_alert_to_profile_wall(driver, profile_url: str, our_post_url: str,
+                                is_alert: bool) -> bool:
+    """Post our alert URL on a target profile's wall via "Napisz coś do <X>..."
+
+    Used to distribute RCB-class meteo alerts to local services (e.g. Straż
+    Miejska) that maintain a public profile and explicitly accept alert
+    notifications. FB auto-renders the pasted URL as a rich embedded post
+    preview — no moderator approval needed (unlike groups).
+
+    ⚠️ HARD GUARD: requires `is_alert=True`. This is the third independent
+    safety layer (alongside RCB_ALERT_EXTRA_PROFILE_POSTS being a separate
+    config list and not being touched by regular share_to_all_groups). The
+    target profiles have agreed to host alerts; pushing daily city-news
+    posts here would get us banned.
+
+    Args:
+        driver: Selenium WebDriver
+        profile_url: FB profile URL of the alert recipient
+        our_post_url: URL of the alert post on our page (the one being shared)
+        is_alert: MUST be True. Raises if False, to make accidental misuse
+                  from regular-cron contexts impossible.
+
+    Returns:
+        True if post was published on the profile wall, False otherwise.
+    """
+    if not is_alert:
+        raise ValueError(
+            "post_alert_to_profile_wall called with is_alert=False — refusing. "
+            "These profiles are ALERT-ONLY recipients and posting daily content "
+            "to them would result in a ban. If you genuinely need this for a "
+            "non-alert run (testing only), pass is_alert=True explicitly with "
+            "a comment, but be aware: it WILL post on Straż Miejska's wall."
+        )
+
+    safe_name = "".join(c if c.isalnum() else "_" for c in profile_url[-20:])
+
+    try:
+        logger.info("=" * 50)
+        logger.info(f"📤 POSTING ALERT TO PROFILE WALL: {profile_url}")
+        logger.info(f"📍 Alert post URL: {our_post_url}")
+        logger.info("=" * 50)
+
+        driver.get(profile_url)
+        human_delay(3, 5)
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_01_profile_loaded.png"))
+
+        # --- Step 1: Click the "Napisz coś do <name>..." entry area to open
+        #     the post composer dialog.
+        composer_entry_selectors = [
+            "//div[@role='button'][.//span[contains(text(), 'Napisz coś do')]]",
+            "//div[@role='textbox'][contains(@aria-placeholder, 'Napisz coś do')]",
+            "//span[contains(text(), 'Napisz coś do')]/ancestor::div[@role='button'][1]",
+            "//span[contains(text(), 'Write something to')]/ancestor::div[@role='button'][1]",
+        ]
+        opened = False
+        for sel in composer_entry_selectors:
+            try:
+                el = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, sel))
+                )
+                el.click()
+                logger.info(f"✅ Opened composer via: {sel}")
+                opened = True
+                human_delay(2, 3)
+                break
+            except Exception:
+                continue
+        if not opened:
+            logger.error("❌ Could not find/click 'Napisz coś do...' entry on profile wall")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_error_no_entry.png"))
+            return False
+
+        # --- Step 2: Find the composer textbox (now in dialog) and paste URL.
+        textbox_selectors = [
+            "//div[@role='dialog']//div[@role='textbox'][@contenteditable='true']",
+            "//div[@role='dialog']//div[@contenteditable='true']",
+        ]
+        textbox = None
+        for sel in textbox_selectors:
+            try:
+                textbox = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, sel))
+                )
+                break
+            except Exception:
+                continue
+        if not textbox:
+            logger.error("❌ No textbox found in profile-wall composer dialog")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_error_no_textbox.png"))
+            return False
+
+        textbox.click()
+        human_delay(0.5, 1)
+        textbox.send_keys(our_post_url)
+        logger.info(f"⌨️ Typed alert URL into composer")
+        # FB needs a few seconds to fetch the URL and render the embed preview
+        human_delay(4, 6)
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_02_url_entered.png"))
+
+        # --- Step 3: Click Opublikuj (mirror of share-to-group fix ordering).
+        publish_selectors = [
+            "//div[@role='dialog']//div[@role='button']//span[text()='Opublikuj']",
+            "//div[@role='dialog']//span[text()='Opublikuj']",
+            "//div[@aria-label='Opublikuj' and @role='button']",
+            "//div[@role='dialog']//span[text()='Post']",
+        ]
+        published = False
+        for sel in publish_selectors:
+            try:
+                btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, sel))
+                )
+                btn.click()
+                logger.info(f"✅ Clicked Opublikuj: {sel}")
+                published = True
+                human_delay(3, 4)
+                break
+            except Exception:
+                continue
+        if not published:
+            logger.error("❌ No publish button found in profile-wall composer")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_error_no_publish.png"))
+            return False
+
+        # Wait for dialog to disappear (= publish confirmed by FB).
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.invisibility_of_element_located(
+                    (By.XPATH, "//div[@role='dialog']//div[@role='textbox'][@contenteditable='true']")
+                )
+            )
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_03_after_publish.png"))
+            logger.info(f"✅ Alert posted on profile wall: {profile_url}")
+            return True
+        except TimeoutException:
+            logger.warning(f"⚠️ Dialog still open 15s after publish — uncertain success. "
+                           f"Check {profile_url} manually.")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / f"debug_wallpost_{safe_name}_error_dialog_still_open.png"))
+            return False
+    except Exception as e:
+        logger.error(f"❌ post_alert_to_profile_wall crashed: {e}")
+        import traceback; traceback.print_exc()
         return False
 
 
