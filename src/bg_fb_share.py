@@ -78,12 +78,22 @@ MONITORED_PAGES = [
     {"name": "Stodola Dzika",                      "url": "https://www.facebook.com/StodolaDzika"},
     # --- Religious communities ---
     {"name": "Kosciol Uliczny Boguszow-Gorce",     "url": "https://www.facebook.com/profile.php?id=100067837419514"},
-    # --- TODO: GROUP-type sources need a separate scraper code path
-    #     (FB groups require authentication and use different DOM markers).
-    #     Pending: Kosciol Zielonoswiatkowy Boguszow-Gorce —
-    #     https://www.facebook.com/groups/799540943412790 ("nasza grupa")
     # --- TODO: WEBSITE sources (non-FB) handled by bg_scraper_selenium.py
     #     extension. Pending: https://bip.boguszow-gorce.pl/ (BIP)
+]
+
+# FB GROUPS to monitor (require authentication — scraped via the same
+# Selenium driver that handles share, after ensure_logged_in_as_page).
+# Group post permalinks are /groups/<gid>/posts/<pid>. parse_fb_posts()
+# also matches aria-posinset on group post divs.
+#
+# CAVEAT: closed-group posts may not be re-shareable to our page (FB
+# only shows Share button on public-group posts in many cases). The
+# scrape happens regardless; share_post() will fail gracefully if the
+# Share button isn't available for a given group post.
+MONITORED_GROUPS = [
+    {"name": "Kosciol Zielonoswiatkowy Boguszow-Gorce",
+     "url": "https://www.facebook.com/groups/799540943412790"},
 ]
 
 # Delays between shares (seconds)
@@ -311,6 +321,52 @@ async def scrape_all_monitored_pages() -> list:
         all_posts.extend(posts)
 
     logger.info(f"Total scraped: {len(all_posts)} post(s) from {len(MONITORED_PAGES)} page(s)")
+    return all_posts
+
+
+# ============================================
+# GROUP SCRAPING (authenticated, via Selenium)
+# ============================================
+
+def scrape_fb_group_with_selenium(driver, group_url: str, group_name: str) -> list:
+    """Scrape recent posts from a Facebook GROUP using an already-authenticated
+    Selenium driver. Required because Playwright unauth can't access group
+    contents (groups require login regardless of public/closed setting).
+
+    Reuses parse_fb_posts() — FB renders group post divs with the same
+    aria-posinset attribute as page posts, so the parser doesn't need
+    group-specific logic.
+    """
+    logger.info(f"Scraping group: {group_name} ({group_url})")
+    try:
+        # Prefer chronological sort so we see most recent first (the feed
+        # default of "Activity" mixes in older posts with new comments).
+        sep = "&" if "?" in group_url else "?"
+        url = f"{group_url}{sep}sorting_setting=CHRONOLOGICAL"
+        driver.get(url)
+        time.sleep(4)
+        # Scroll a bit to load posts past the fold
+        for _ in range(3):
+            driver.execute_script("window.scrollBy(0, 800)")
+            time.sleep(1.5)
+        html = driver.page_source
+        posts = parse_fb_posts(html, group_url, group_name)
+        logger.info(f"  Found {len(posts)} post(s) from {group_name}")
+        return posts
+    except Exception as e:
+        logger.error(f"  Error scraping group {group_name}: {e}")
+        return []
+
+
+def scrape_all_monitored_groups(driver) -> list:
+    """Sequentially scrape all MONITORED_GROUPS using the given Selenium
+    driver (must already be navigated/logged in as a member or admin).
+    """
+    all_posts = []
+    for cfg in MONITORED_GROUPS:
+        posts = scrape_fb_group_with_selenium(driver, cfg["url"], cfg["name"])
+        all_posts.extend(posts)
+        human_delay(2, 4)
     return all_posts
 
 
@@ -767,48 +823,70 @@ def main():
     save_shared_posts(shared_posts)
 
     # Step 3: Scrape all monitored pages for recent posts using Playwright
-    logger.info("--- Phase 1: Scraping monitored pages ---")
-    all_posts = asyncio.run(scrape_all_monitored_pages())
+    logger.info("--- Phase 1: Scraping monitored pages (Playwright unauth) ---")
+    page_posts = asyncio.run(scrape_all_monitored_pages())
 
-    if not all_posts:
-        logger.info("No posts found from monitored pages.")
+    # Filter pages-source posts by what's already shared
+    new_page_posts = [
+        p for p in page_posts
+        if normalize_post_url(p['url']) not in shared_posts
+    ]
+    page_skipped = len(page_posts) - len(new_page_posts)
+    if page_skipped > 0:
+        logger.info(f"Pages: skipped {page_skipped} already-shared post(s)")
+
+    # Early exit only if BOTH no new page posts AND no groups configured.
+    # When MONITORED_GROUPS is non-empty we still need to spin up Selenium
+    # to scrape them (authenticated) before deciding.
+    if not new_page_posts and not MONITORED_GROUPS:
+        logger.info("No new posts to share and no groups configured.")
         return
 
-    # Step 4: Filter out already shared posts
-    new_posts = []
-    for post in all_posts:
-        normalized_url = normalize_post_url(post['url'])
-        if normalized_url not in shared_posts:
-            new_posts.append(post)
-
-    skipped = len(all_posts) - len(new_posts)
-    if skipped > 0:
-        logger.info(f"Skipped {skipped} already shared post(s)")
-
-    if not new_posts:
-        logger.info("No new posts to share.")
+    if TEST_MODE and not MONITORED_GROUPS:
+        # Pure dry-run path when no groups would be touched
+        logger.info(f"[TEST MODE] {len(new_page_posts)} new page post(s) would be shared:")
+        for i, p in enumerate(new_page_posts, 1):
+            logger.info(f"  {i}. [{p['source_name']}] {p['url']}")
         return
 
-    logger.info(f"Found {len(new_posts)} new post(s) to share:")
-    for i, post in enumerate(new_posts, 1):
-        logger.info(f"  {i}. [{post['source_name']}] {post['url']}")
-        if post.get('text_snippet'):
-            logger.info(f"     {post['text_snippet'][:100]}...")
-
-    if TEST_MODE:
-        logger.info("[TEST MODE] Would share the above posts. Exiting.")
-        return
-
-    # Step 5: Launch Docker Selenium
+    # Step 4: Launch Docker Selenium (needed for groups AND for sharing)
     logger.info("--- Phase 2: Sharing via Selenium ---")
     driver = None
 
     try:
         driver = setup_driver()
 
-        # Step 6: Ensure logged in as the page
+        # Step 5: Ensure logged in as the page
         if not ensure_logged_in_as_page(driver):
             logger.error("Could not verify page login. Aborting.")
+            return
+
+        # Step 6: Authenticated group scrape (uses same driver)
+        new_posts = list(new_page_posts)
+        if MONITORED_GROUPS:
+            logger.info(f"--- Phase 2a: Scraping {len(MONITORED_GROUPS)} group(s) (authenticated) ---")
+            group_posts = scrape_all_monitored_groups(driver)
+            new_group_posts = [
+                p for p in group_posts
+                if normalize_post_url(p['url']) not in shared_posts
+            ]
+            group_skipped = len(group_posts) - len(new_group_posts)
+            if group_skipped > 0:
+                logger.info(f"Groups: skipped {group_skipped} already-shared post(s)")
+            new_posts.extend(new_group_posts)
+
+        if not new_posts:
+            logger.info("No new posts to share (after group scrape).")
+            return
+
+        logger.info(f"Found {len(new_posts)} new post(s) to share:")
+        for i, post in enumerate(new_posts, 1):
+            logger.info(f"  {i}. [{post['source_name']}] {post['url']}")
+            if post.get('text_snippet'):
+                logger.info(f"     {post['text_snippet'][:100]}...")
+
+        if TEST_MODE:
+            logger.info("[TEST MODE] Would share the above posts. Exiting.")
             return
 
         # Step 7: Share each new post
