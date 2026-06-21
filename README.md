@@ -65,27 +65,39 @@ and publishes. Post URL detection filters for the page's own posts (kangurello /
 100027689516729) to avoid sharing foreign posts from the feed. All steps are logged
 with debug screenshots.
 
-## IMGW Meteo Alert Mode (RCB-style)
+## IMGW Meteo Alert Mode (RCB-style) — independent hourly stream
 
-Mirror of the wch alert architecture (see wchNews README for the visual /
-banner / verification design). bg uses TERYT **`0221`** (powiat wałbrzyski,
-where Boguszów-Gorce sits — verified via Nominatim reverse-geocode on all
-7 DISTRICTS).
+**Architecture (added 2026-06-21)**: alert publishing is a separate
+stream from the regular weather-map cron. They never interfere.
 
-Status:
-- **Safety machinery: in place** — `_derive_verification_needle`,
-  `verify_post_published_and_get_url`, tuple-returning
-  `post_to_facebook_selenium`, `FB_PAGE_URL` guard in
-  `share_to_all_groups`, pre-publish embed guard in `share_post_to_group`.
-  All identical to wch (commit `6a7dce7`).
-- **Alert-mode wiring in `main()`: pending** — `generate_map_image()`
-  is not yet alert-aware. Today's bg alert post was produced via the
-  one-off `/tmp/bg_publish_alert_test.py` against a hand-positioned
-  preview (`/tmp/bg_map_preview_v5.png`: `map_storm.png` + overlay
-  `stormRCB2transpartentBCKG.png` at `OFF_X=680, OFF_Y=-90` size 640×640,
-  plus the broadcast banner + cards + Scarlet temps composed on top).
-  Wiring this into `main()` so the regular cron handles alerts
-  automatically is a remaining task.
+| Stream | Script | Cron | Behaviour |
+|---|---|---|---|
+| Normal | `bg_weather_map_selenium.py` (`main()`) | 06:30 / 19:15 | always normal-mode map, never touches IMGW |
+| **Alert (NEW)** | `bg_rcb_alert_checker.py` | `5 * * * *` (every hour) | fetches IMGW; publishes alert post only when a NEW warning ID is detected; ALSO distributes to RCB_ALERT_EXTRA_PROFILE_POSTS walls (Straż Miejska) |
+
+bg uses TERYT **`0221`** (powiat wałbrzyski, where Boguszów-Gorce sits
+— verified via Nominatim reverse-geocode on all 7 DISTRICTS).
+
+The alert checker dedupes against `data/posted_alerts.json` — a JSON
+map of `{warning_id: metadata}`. If all currently-active warning IDs
+are already in state → exits quietly. State entries are pruned after
+`obowiazuje_do` has been in the past for more than 48 h.
+
+Alert map composition (in `publish_rcb_alert_only()`):
+- base map `map_storm.png`
+- composite overlay `stormRCB2transpartentBCKG.png` at
+  `OFF_X=680, OFF_Y=-90`, size 640×640 (user-approved positioning
+  iterated 2026-06-20)
+- Scarlet `#FF2400` district temperatures
+- broadcast banner `banerTopRCB.png` on top, scaled to map width
+- dynamic warning cards (one per active warning, accent stripe color
+  by stopień: red for 2/3, yellow for 1)
+- soft drop shadow under banner block
+
+Safety machinery (identical to wch): strict caption-needle DOM
+verification with two-mode permalink extraction, FB_PAGE_URL guard
+in `share_to_all_groups`, pre-publish embed guard in
+`share_post_to_group`. See wch README "2026-06-20 incident" section.
 
 ### RCB-only extra distribution (`RCB_ALERT_EXTRA_PROFILE_POSTS`)
 
@@ -171,6 +183,8 @@ Chrome profile persists in `docker-data/chrome-profile/` (volume mount).
 
 ## Changelog
 
+- **2026-06-21** — Add independent hourly RCB alert stream (mirror of wch 2026-06-21). NEW `src/bg_rcb_alert_checker.py` runs `5 * * * *`, dedupes against `data/posted_alerts.json`, publishes alert post only on NEW IMGW warning ID. Adds full alert-side machinery to `bg_weather_map_selenium.py`: `_compose_bg_alert_map` (map_storm + stormRCB2 overlay + Scarlet temps), `compose_alert_top` (broadcast banner + cards + drop shadow), `publish_rcb_alert_only` (full publish + Straż Miejska wall distribution). State seeded with currently-active Burze st.2 + Upał st.1.
+- **2026-06-21** — Expand `MONITORED_PAGES` 4 → 12 + add `MONITORED_GROUPS` (FB groups via authenticated Selenium scrape).
 - **2026-06-20** — Add IMGW alert helpers + bug-proof publish/share verification (mirror of wch `ac71b0a`). Adds `_derive_verification_needle`, `verify_post_published_and_get_url`, tuple-returning `post_to_facebook_selenium` with strict caption-needle DOM verification, FB_PAGE_URL guard in `share_to_all_groups`, pre-publish embed guard in `share_post_to_group`. Dismisses "Organizujesz wydarzenie?" upsell. Adds asset files `banerTopRCB.png` + `stormRCB2transpartentBCKG.png` for storm-icon overlay over existing `map_storm.png`. **Alert-mode wiring in `main()` still pending.**
 - **2026-06-20** — Add `WMAP_FAST_MODE` env var for ad-hoc/emergency runs (shortens `human_delay` to 0.3 s; keeps anti-spam `SHARE_DELAY_MIN/MAX` at production values).
 - **2026-06-20** — Add `RCB_ALERT_EXTRA_PROFILE_POSTS` config + `post_alert_to_profile_wall()` for distributing alerts to local-service profiles (Straż Miejska Boguszów-Gorce). Triple-guarded ALERT-ONLY (separate list + `is_alert=True` runtime guard + warning docs) — these profiles must never receive regular daily content (ban risk).
