@@ -44,6 +44,14 @@ USE_DOCKER = True
 PROJECT_ROOT = Path(__file__).parent.parent
 LOG_FILE = PROJECT_ROOT / "logs" / "bg_fb_share.log"
 SHARED_POSTS_FILE = PROJECT_ROOT / "data" / "shared_posts.json"
+# Failed-share dedupe: URLs that failed share recently. Prevents the same
+# unshareable URL from being retried every 4 hours indefinitely (e.g. if
+# FB changes a Reel's share UI, our selectors miss for a day, but we
+# don't waste Selenium time on the same Reel 6x/day). TTL via
+# FAILED_SHARE_RETRY_HOURS — after that we'll try again in case FB
+# changed back or we shipped a selector fix.
+FAILED_SHARES_FILE = PROJECT_ROOT / "data" / "failed_shares.json"
+FAILED_SHARE_RETRY_HOURS = 24
 LOCK_FILE = PROJECT_ROOT / "locks" / "fb_share.lock"
 DEBUG_DIR = PROJECT_ROOT / "debug"
 
@@ -214,6 +222,46 @@ def cleanup_old_posts(shared_posts: dict) -> dict:
 
 
 # ============================================
+# FAILED-SHARE DEDUPE (with TTL)
+# ============================================
+
+def load_failed_shares() -> dict:
+    """Load {normalized_url: failed_at_iso_timestamp} of recently-failed shares."""
+    if not FAILED_SHARES_FILE.exists():
+        return {}
+    try:
+        return json.loads(FAILED_SHARES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"Could not load {FAILED_SHARES_FILE}: {e} — starting fresh")
+        return {}
+
+
+def save_failed_shares(state: dict) -> None:
+    FAILED_SHARES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FAILED_SHARES_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def prune_failed_shares(state: dict) -> dict:
+    """Remove entries older than FAILED_SHARE_RETRY_HOURS so they get retried."""
+    cutoff = datetime.now() - timedelta(hours=FAILED_SHARE_RETRY_HOURS)
+    cutoff_iso = cutoff.isoformat()
+    cleaned = {url: ts for url, ts in state.items() if ts > cutoff_iso}
+    removed = len(state) - len(cleaned)
+    if removed > 0:
+        logger.info(f"Failed-shares: pruned {removed} entry/entries past TTL "
+                    f"({FAILED_SHARE_RETRY_HOURS}h) — will retry")
+    return cleaned
+
+
+def mark_share_failed(state: dict, post_url: str) -> dict:
+    """Record post_url as a recent failure so we don't retry until TTL elapses."""
+    state[normalize_post_url(post_url)] = datetime.now().isoformat()
+    save_failed_shares(state)
+    return state
+
+
+# ============================================
 # PLAYWRIGHT SCRAPING - FACEBOOK POSTS
 # ============================================
 
@@ -247,11 +295,38 @@ def parse_fb_posts(html: str, source_url: str, source_name: str) -> list:
             continue
 
         href = links[0].get('href', '')
-        clean_href = href.split('?')[0]
-        if clean_href.startswith('/'):
-            post_url = f"https://www.facebook.com{clean_href}"
+
+        # CRITICAL: don't blindly strip query params. For /photo/ URLs the
+        # fbid query is the photo identifier — strip it and you get a
+        # generic "/photo/" URL that points nowhere and can't be shared.
+        # Same risk for /video.php?v=... Keep query for these types.
+        # For /posts/<id>/, /reel/<id>/, /watch/?v=<id> with id in path,
+        # the trailing query is FB tracking junk and can be stripped.
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(href)
+        path = parsed.path
+        if '/photo/' in path or '/photo.php' in path:
+            qs = parse_qs(parsed.query)
+            fbid = (qs.get('fbid') or [''])[0]
+            if fbid:
+                post_url = f"https://www.facebook.com/photo?fbid={fbid}"
+            else:
+                # No fbid → this isn't shareable, skip rather than store junk
+                continue
+        elif '/video.php' in path or '/watch' in path:
+            qs = parse_qs(parsed.query)
+            vid = (qs.get('v') or [''])[0]
+            if vid:
+                post_url = f"https://www.facebook.com/watch/?v={vid}"
+            else:
+                continue
         else:
-            post_url = clean_href
+            # /posts/, /reel/, /videos/ — id is in path, strip tracking query
+            clean_href = href.split('?')[0]
+            if clean_href.startswith('/'):
+                post_url = f"https://www.facebook.com{clean_href}"
+            else:
+                post_url = clean_href
 
         # Normalize for deduplication
         normalized = normalize_post_url(post_url)
@@ -632,11 +707,23 @@ def share_post(driver, post: dict) -> bool:
             return False
 
         # Step 2: Find and click the "Share" / "Udostepnij" button on the post
+        # Different post types render different share-button aria-labels:
+        #   - Regular post: aria-label='Send this to friends or post it on your profile.'
+        #   - Reel: aria-label='Udostępnij' (the simpler one)
+        #   - Photo: similar to regular post
+        # Order matters — try Reel-specific aria-label early so a Reel doesn't
+        # accidentally match a sidebar "Udostępnij" span first.
+        is_reel = '/reel/' in post_url
+        if is_reel:
+            logger.info("  Reel detected — using Reel-specific share selectors")
         logger.info("  Looking for Share button...")
 
         share_button_selectors = [
             "//div[@aria-label='Send this to friends or post it on your profile.']",
             "//div[@aria-label='Wy\u015blij znajomym lub opublikuj na swoim profilu.']",
+            # Reel uses a simpler aria-label — also generic 'Udostępnij' on photo posts
+            "//div[@aria-label='Udost\u0119pnij' and @role='button']",
+            "//div[@aria-label='Share' and @role='button']",
             "//span[text()='Udost\u0119pnij']",
             "//span[text()='Share']",
         ]
@@ -817,20 +904,32 @@ def main():
     # Register cleanup handlers
     atexit.register(release_script_lock)
 
-    # Step 2: Load shared_posts.json, cleanup old entries
+    # Step 2: Load shared_posts.json + failed_shares.json, cleanup
     shared_posts = load_shared_posts()
     shared_posts = cleanup_old_posts(shared_posts)
     save_shared_posts(shared_posts)
+    failed_shares = load_failed_shares()
+    failed_shares = prune_failed_shares(failed_shares)
+    save_failed_shares(failed_shares)
 
     # Step 3: Scrape all monitored pages for recent posts using Playwright
     logger.info("--- Phase 1: Scraping monitored pages (Playwright unauth) ---")
     page_posts = asyncio.run(scrape_all_monitored_pages())
 
-    # Filter pages-source posts by what's already shared
-    new_page_posts = [
-        p for p in page_posts
-        if normalize_post_url(p['url']) not in shared_posts
-    ]
+    # Filter pages-source posts by what's already shared OR recently failed
+    new_page_posts = []
+    failed_skipped = 0
+    for p in page_posts:
+        nu = normalize_post_url(p['url'])
+        if nu in shared_posts:
+            continue
+        if nu in failed_shares:
+            failed_skipped += 1
+            continue
+        new_page_posts.append(p)
+    if failed_skipped > 0:
+        logger.info(f"Pages: skipped {failed_skipped} post(s) that failed recently "
+                    f"(will retry after {FAILED_SHARE_RETRY_HOURS}h)")
     page_skipped = len(page_posts) - len(new_page_posts)
     if page_skipped > 0:
         logger.info(f"Pages: skipped {page_skipped} already-shared post(s)")
@@ -866,13 +965,22 @@ def main():
         if MONITORED_GROUPS:
             logger.info(f"--- Phase 2a: Scraping {len(MONITORED_GROUPS)} group(s) (authenticated) ---")
             group_posts = scrape_all_monitored_groups(driver)
-            new_group_posts = [
-                p for p in group_posts
-                if normalize_post_url(p['url']) not in shared_posts
-            ]
-            group_skipped = len(group_posts) - len(new_group_posts)
-            if group_skipped > 0:
-                logger.info(f"Groups: skipped {group_skipped} already-shared post(s)")
+            new_group_posts = []
+            group_already_skipped = 0
+            group_failed_skipped = 0
+            for p in group_posts:
+                nu = normalize_post_url(p['url'])
+                if nu in shared_posts:
+                    group_already_skipped += 1
+                    continue
+                if nu in failed_shares:
+                    group_failed_skipped += 1
+                    continue
+                new_group_posts.append(p)
+            if group_already_skipped > 0:
+                logger.info(f"Groups: skipped {group_already_skipped} already-shared post(s)")
+            if group_failed_skipped > 0:
+                logger.info(f"Groups: skipped {group_failed_skipped} post(s) failed recently")
             new_posts.extend(new_group_posts)
 
         if not new_posts:
@@ -906,6 +1014,11 @@ def main():
                 logger.info(f"  Marked as shared: {normalized_url}")
             else:
                 logger.warning(f"  Failed to share: {post['url']}")
+                # Add to failed_shares so we don't retry every 4h. TTL via
+                # FAILED_SHARE_RETRY_HOURS allows automatic re-attempt if
+                # FB UI changes or we ship a selector fix.
+                failed_shares = mark_share_failed(failed_shares, post['url'])
+                logger.info(f"  Marked failed (retry after {FAILED_SHARE_RETRY_HOURS}h)")
 
             # Random delay between shares (except after the last one)
             if i < len(new_posts) - 1:
