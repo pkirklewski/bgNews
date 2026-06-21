@@ -126,6 +126,28 @@ FAST_MODE_REUSE_MAX_AGE_SEC = 3 * 3600  # reuse output PNG if <3 h old
 IMGW_TERYT_CODES = ["0221"]
 IMGW_WARNINGS_URL = "https://danepubliczne.imgw.pl/api/data/warningsmeteo/teryt/{teryt}"
 
+# RCB alert visual config (mirror of wch). The alert image is composed as:
+#   map_storm.png (base) + stormRCB2transpartentBCKG.png (overlay at
+#   position below) + scarlet temps + banerTopRCB.png (broadcast banner
+#   on top) + dynamic warning cards + drop shadow under banner block.
+RCB_ALERT_TEMP_COLOR = (255, 36, 0)            # Scarlet #FF2400
+RCB_ALERT_BANNER_FILE = "banerTopRCB.png"      # broadcast-style alert banner
+RCB_ALERT_STORM_BASE = "map_storm.png"         # base map (with city outline)
+RCB_ALERT_STORM_OVERLAY = "stormRCB2transpartentBCKG.png"  # dramatic storm cloud
+# Overlay positioning iterated with user 2026-06-20 (v5 was final):
+RCB_OVERLAY_W = 640
+RCB_OVERLAY_X = 680
+RCB_OVERLAY_Y = -90  # slight negative — overlay extends above map top
+RCB_CARD_BG = (255, 248, 232)                   # cream cards background
+RCB_CARD_INK = (24, 24, 24)
+RCB_CARD_INK_SOFT = (60, 60, 60)
+RCB_CARD_ACCENT_RED = (192, 57, 43)             # stopień 2/3 accent stripe
+RCB_CARD_ACCENT_YELLOW = (245, 195, 0)          # stopień 1 accent stripe
+RCB_CARD_SEPARATOR = (215, 175, 100)
+RCB_CARDS_HEIGHT = 110
+RCB_SHADOW_HEIGHT = 22
+RCB_SHADOW_MAX_ALPHA = 180
+
 # Banner colors by stopień (1=informacyjne, 2=ostrzeżenie, 3=alarm)
 WARNING_STOPIEN_COLOR = {
     "1": (255, 213, 3),    # Yellow #FFD503 (matches our temp palette)
@@ -2924,6 +2946,339 @@ def share_to_all_groups(driver, post_url: str, caption: str,
     logger.info("=" * 60)
 
     return successful_shares
+
+
+# ============================================
+# RCB ALERT DEDUPE STATE (mirror of wch)
+# ============================================
+RCB_ALERT_STATE_FILE = PROJECT_ROOT / "data" / "posted_alerts.json"
+
+
+def _load_posted_alerts() -> dict:
+    if not RCB_ALERT_STATE_FILE.exists():
+        return {}
+    try:
+        import json
+        return json.loads(RCB_ALERT_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"⚠️ Could not load {RCB_ALERT_STATE_FILE}: {e} — starting fresh")
+        return {}
+
+
+def _save_posted_alerts(state: dict) -> None:
+    import json
+    RCB_ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    RCB_ALERT_STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _prune_posted_alerts(state: dict, grace_hours: int = 48) -> dict:
+    now = datetime.now()
+    pruned = {}
+    for wid, data in state.items():
+        try:
+            d_to = datetime.strptime(data.get('obowiazuje_do', ''),
+                                      "%Y-%m-%d %H:%M:%S")
+            age_hours = (now - d_to).total_seconds() / 3600
+            if age_hours <= grace_hours:
+                pruned[wid] = data
+        except Exception:
+            pruned[wid] = data
+    return pruned
+
+
+def get_new_imgw_alerts() -> tuple:
+    """Returns (new_warnings, all_active_warnings). See wch counterpart."""
+    all_active = fetch_imgw_warnings(IMGW_TERYT_CODES)
+    if not all_active:
+        return ([], [])
+    state = _load_posted_alerts()
+    new = [w for w in all_active if w.get('id') not in state]
+    return (new, all_active)
+
+
+def _mark_alerts_posted(warnings: list) -> None:
+    state = _load_posted_alerts()
+    state = _prune_posted_alerts(state)
+    now_iso = datetime.now().isoformat()
+    for w in warnings:
+        wid = w.get('id')
+        if not wid:
+            continue
+        state[wid] = {
+            'nazwa_zdarzenia': w.get('nazwa_zdarzenia'),
+            'stopien': w.get('stopien'),
+            'prawdopodobienstwo': w.get('prawdopodobienstwo'),
+            'obowiazuje_od': w.get('obowiazuje_od'),
+            'obowiazuje_do': w.get('obowiazuje_do'),
+            'posted_at': now_iso,
+        }
+    _save_posted_alerts(state)
+
+
+# ============================================
+# RCB ALERT — MAP COMPOSITION + PUBLISH
+# ============================================
+
+def _compose_bg_alert_map(districts_data: list, warnings: list) -> str:
+    """Build the bg alert map image from scratch:
+      1. Load map_storm.png as base
+      2. Composite stormRCB2transpartentBCKG.png at (RCB_OVERLAY_X, Y) size RCB_OVERLAY_W
+      3. Draw district temperatures in Scarlet
+      4. Add charity overlay
+      5. Add footer
+      6. Save to output/
+
+    Returns path to saved PNG.
+    """
+    output_path = PROJECT_ROOT / "output" / OUTPUT_IMAGE_FILENAME
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    base_path = MAPS_DIR / RCB_ALERT_STORM_BASE
+    overlay_path = MAPS_DIR / RCB_ALERT_STORM_OVERLAY
+
+    base = Image.open(base_path).convert('RGBA')
+    if overlay_path.exists():
+        overlay = Image.open(overlay_path).convert('RGBA')
+        oh = int(overlay.size[1] * (RCB_OVERLAY_W / overlay.size[0]))
+        overlay = overlay.resize((RCB_OVERLAY_W, oh), Image.LANCZOS)
+        base.alpha_composite(overlay, dest=(RCB_OVERLAY_X, RCB_OVERLAY_Y))
+        logger.info(f"✅ Alert overlay {RCB_OVERLAY_W}×{oh} composited at "
+                    f"({RCB_OVERLAY_X}, {RCB_OVERLAY_Y})")
+    else:
+        logger.warning(f"⚠️ Storm overlay {overlay_path} missing — base only")
+
+    draw = ImageDraw.Draw(base)
+    font_temp = get_font(55, bold=True)
+    font_info = get_font(24, bold=True)
+
+    min_t, max_t = 100, -100
+    for d in districts_data:
+        temp = round(d['temp'])
+        if temp < min_t: min_t = temp
+        if temp > max_t: max_t = temp
+        temp_str = f"{temp:+d}°" if temp != 0 else "0°"
+        draw_text_centered(draw, d['x'], d['y'], temp_str, font_temp,
+                           RCB_ALERT_TEMP_COLOR)
+
+    now_str = datetime.now().strftime("%d.%m.%Y godz. %H:%M")
+    draw.text((base.size[0] - 450, base.size[1] - 25),
+              f"Stan na: {now_str} | Dane: Open-Meteo + IMGW",
+              font=font_info, fill=(0, 0, 0))
+
+    base = add_charity_overlay(base)
+    base.save(output_path, "PNG")
+    logger.info(f"✅ Alert base map saved: {output_path} (temps {min_t}-{max_t}°C)")
+    return str(output_path), min_t, max_t
+
+
+def compose_alert_top(map_path: str, warnings: list) -> str:
+    """Prepend broadcast banner (banerTopRCB.png) + dynamic warning cards
+    + drop shadow on top of the alert map. Mutates file in place.
+    """
+    if not warnings:
+        return map_path
+    try:
+        base = Image.open(map_path).convert('RGBA')
+        map_w, map_h = base.size
+
+        banner_path = MAPS_DIR / RCB_ALERT_BANNER_FILE
+        if not banner_path.exists():
+            logger.warning(f"⚠️ {banner_path} missing — skipping alert banner overlay")
+            return map_path
+        banner_orig = Image.open(banner_path).convert('RGBA')
+        bw, bh = banner_orig.size
+        top_h = int(bh * (map_w / bw))
+        banner = banner_orig.resize((map_w, top_h), Image.LANCZOS)
+
+        banner_block_h = top_h + RCB_CARDS_HEIGHT
+        canvas = Image.new('RGBA', (map_w, map_h + banner_block_h),
+                           RCB_CARD_BG + (255,))
+        canvas.paste(banner, (0, 0))
+        d = ImageDraw.Draw(canvas)
+        d.rectangle([0, top_h, map_w, banner_block_h], fill=RCB_CARD_BG)
+
+        font_card_title = get_font(22, bold=True)
+        font_card_time = get_font(20, bold=True)
+
+        def _accent(st_str):
+            return RCB_CARD_ACCENT_RED if st_str in ('2', '3') else RCB_CARD_ACCENT_YELLOW
+
+        def _card(x, y, w, h, accent, name, stopien, time_range):
+            d.rectangle([x, y, x + 8, y + h], fill=accent)
+            ix = x + 8 + 18
+            title = f"{name.upper()}  —  STOPIEŃ {stopien}"
+            d.text((ix, y + 14), title, font=font_card_title, fill=RCB_CARD_INK)
+            d.text((ix, y + 52), time_range, font=font_card_time, fill=RCB_CARD_INK_SOFT)
+
+        pad = 8
+        card_w = (map_w - 3 * pad) // 2
+
+        def _card_for(idx, x_off):
+            wd = warnings[idx]
+            df = wd.get('obowiazuje_od', '') or ''
+            dt = wd.get('obowiazuje_do', '') or ''
+            tr = (f"{df[8:10]}.{df[5:7]} {df[11:16]} → "
+                  f"{dt[8:10]}.{dt[5:7]} {dt[11:16]}") if df and dt else ""
+            _card(x_off, top_h + 8, card_w, RCB_CARDS_HEIGHT - 16,
+                  _accent(str(wd.get('stopien'))),
+                  wd.get('nazwa_zdarzenia', '?'),
+                  str(wd.get('stopien', '?')), tr)
+
+        if len(warnings) >= 1:
+            _card_for(0, pad)
+        if len(warnings) >= 2:
+            _card_for(1, 2 * pad + card_w)
+            sep_x = 2 * pad + card_w - pad // 2
+            d.line([(sep_x, top_h + 18), (sep_x, banner_block_h - 18)],
+                   fill=RCB_CARD_SEPARATOR, width=1)
+
+        canvas.paste(base, (0, banner_block_h))
+
+        # Drop shadow under banner block
+        sh = Image.new('RGBA', (map_w, RCB_SHADOW_HEIGHT), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(sh)
+        for i in range(RCB_SHADOW_HEIGHT):
+            t = i / max(RCB_SHADOW_HEIGHT - 1, 1)
+            a = int(RCB_SHADOW_MAX_ALPHA * (1 - t) ** 1.6)
+            sd.line([(0, i), (map_w, i)], fill=(0, 0, 0, a))
+        canvas.alpha_composite(sh, dest=(0, banner_block_h))
+
+        canvas.convert('RGB').save(map_path, "PNG")
+        logger.info(f"✅ Alert banner composed onto {map_path} "
+                    f"(banner_h={top_h}, cards_h={RCB_CARDS_HEIGHT})")
+        return map_path
+    except Exception as e:
+        logger.error(f"❌ compose_alert_top failed: {e}")
+        return map_path
+
+
+def publish_rcb_alert_only(warnings: list) -> bool:
+    """Full bg alert publish flow — generates alert map (with storm overlay
+    + scarlet temps + banner + cards), posts to bg FB page, shares to all
+    configured groups, and posts to each RCB_ALERT_EXTRA_PROFILE_POSTS
+    wall (e.g. Straż Miejska).
+
+    Called by hourly bg_rcb_alert_checker.py only when a NEW warning ID
+    is detected (dedupes via posted_alerts.json).
+    """
+    if not warnings:
+        logger.warning("publish_rcb_alert_only called with empty warnings — no-op")
+        return False
+
+    logger.info("=" * 60)
+    logger.info(f"🚨 RCB ALERT publish (bg) — {len(warnings)} active warning(s)")
+    for w in warnings:
+        logger.info(f"   • {w.get('nazwa_zdarzenia')} st={w.get('stopien')} "
+                    f"({w.get('obowiazuje_od')} → {w.get('obowiazuje_do')})")
+    logger.info("=" * 60)
+
+    # 1. Weather data
+    districts_weather = fetch_districts_weather()
+    if not districts_weather:
+        logger.error("Brak danych pogodowych — przerywam alert publish.")
+        return False
+
+    forecast = fetch_forecast_center()
+    mode = forecast.get('forecast_mode', 'day') if forecast else 'day'
+    forecast_desc = None
+    try:
+        if forecast and forecast.get('hourly') and forecast['hourly'].get('temps'):
+            forecast_text, forecast_desc = generate_professional_forecast_text(
+                forecast['hourly'], mode)
+        elif forecast:
+            forecast_text = generate_forecast_text(forecast)
+        else:
+            forecast_text = "Sprawdź temperaturę w swojej dzielnicy na mapie."
+    except Exception as e:
+        logger.error(f"Forecast generation error: {e}")
+        forecast_text = "Sprawdź temperaturę w swojej dzielnicy na mapie."
+
+    # 2. Build alert map (storm base + overlay + scarlet temps)
+    map_path, min_t, max_t = _compose_bg_alert_map(districts_weather, warnings)
+
+    # 3. Compose banner on top
+    compose_alert_top(map_path, warnings)
+
+    # 4. Caption
+    desc = forecast_desc or "Pochmurno"
+    range_str = format_temp(min_t) if min_t == max_t else f"od {format_temp(min_t)} do {format_temp(max_t)}"
+
+    warnings_block = format_warnings_for_caption(warnings)
+    warnings_prefix = (warnings_block + "\n\n") if warnings_block else ""
+
+    caption = f"""{warnings_prefix}🌡️ Aktualna temperatura w Boguszowie-Gorcach: {range_str}. {desc}.
+{forecast_text}
+
+❤️ Mieszkańcu Boguszowa-Gorc — możesz wesprzeć lokalną fundację.
+👉 To nic Cię nie kosztuje. KRS: 0000498479
+
+Więcej: {FB_PROFILE_LINK}
+
+#BoguszówGorce #Boguszów #DolnyŚląsk"""
+
+    # 5. Verify needle — bg uses ", prawdopodobieństwo" format
+    w0 = warnings[0]
+    _name = w0.get('nazwa_zdarzenia', '?')
+    _st = w0.get('stopien', '?')
+    _prob = w0.get('prawdopodobienstwo', '')
+    if _prob:
+        verify_needle = f"{_name} — stopień {_st}, prawdopodobieństwo {_prob}%"
+    else:
+        verify_needle = f"{_name} — stopień {_st}"
+
+    # 6. Driver + login + post
+    driver = None
+    try:
+        driver = setup_chrome_driver_with_retry()
+        if not ensure_logged_in_as_page(driver):
+            logger.error("Could not verify page login — aborting alert publish.")
+            return False
+
+        success, page_post_url = post_to_facebook_selenium(
+            driver, map_path, caption,
+            verify_needle=verify_needle, test_mode=False,
+        )
+        if not success or not page_post_url:
+            logger.error("Alert page post failed verification — NOT updating state.")
+            return False
+
+        logger.info(f"✅ Alert published + verified: {page_post_url}")
+
+        # 7. Share to ALL groups (alert mode = full group list)
+        if SHARE_TO_GROUPS_ENABLED and SHARE_TO_GROUPS:
+            share_cap = len(SHARE_TO_GROUPS)
+            shares_count = share_to_all_groups(
+                driver, page_post_url, caption, max_groups=share_cap)
+            logger.info(f"📊 Shared to {shares_count} groups")
+
+        # 8. RCB-only profile-wall distribution (Straż Miejska etc.)
+        if RCB_ALERT_EXTRA_PROFILE_POSTS:
+            wall_ok = 0
+            for prof_url in RCB_ALERT_EXTRA_PROFILE_POSTS:
+                try:
+                    if post_alert_to_profile_wall(driver, prof_url, page_post_url,
+                                                   is_alert=True):
+                        wall_ok += 1
+                except Exception as e:
+                    logger.error(f"Profile wall post to {prof_url} failed: {e}")
+            logger.info(f"📤 Profile walls: {wall_ok}/"
+                        f"{len(RCB_ALERT_EXTRA_PROFILE_POSTS)} succeeded")
+
+        # 9. Mark warnings as posted
+        _mark_alerts_posted(warnings)
+        return True
+    except Exception as e:
+        logger.error(f"❌ publish_rcb_alert_only crashed: {e}")
+        import traceback; traceback.print_exc()
+        return False
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 # ============================================

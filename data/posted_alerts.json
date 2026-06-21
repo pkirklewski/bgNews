@@ -1,0 +1,18 @@
+{
+  "Sk20260621032213844": {
+    "nazwa_zdarzenia": "Burze",
+    "stopien": "2",
+    "prawdopodobienstwo": "80",
+    "obowiazuje_od": "2026-06-21 17:00:00",
+    "obowiazuje_do": "2026-06-22 08:00:00",
+    "posted_at": "2026-06-21T14:12:24.901192"
+  },
+  "Sk20260618100541659": {
+    "nazwa_zdarzenia": "Upał",
+    "stopien": "1",
+    "prawdopodobienstwo": "90",
+    "obowiazuje_od": "2026-06-19 13:00:00",
+    "obowiazuje_do": "2026-06-21 18:00:00",
+    "posted_at": "2026-06-21T14:12:24.901192"
+  }
+}
