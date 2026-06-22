@@ -266,11 +266,39 @@ def mark_share_failed(state: dict, post_url: str) -> dict:
 # ============================================
 
 def normalize_post_url(url: str) -> str:
-    """Normalize a Facebook post URL by stripping query parameters."""
+    """Normalize a Facebook post URL for dedup purposes.
+
+    Strips FB tracking query params (__tn__, __cft__, ref, set, etc.)
+    but PRESERVES identifier-bearing params that distinguish posts:
+      - fbid       — photo identifier (/photo?fbid=XYZ)
+      - v          — video identifier (/watch?v=XYZ)
+      - story_fbid — story identifier (/permalink.php?story_fbid=XYZ)
+      - id         — page id paired with story_fbid
+
+    Previously this function did `url.split('?')[0]` which collapsed
+    EVERY photo post to `https://www.facebook.com/photo` — making
+    the first scraped photo "shared" for all eternity and blocking
+    every subsequent photo post (Burmistrz, Kościół Zielonoświątkowy
+    group photos, etc.) from being shared. Discovered 2026-06-22 when
+    user reported that Burmistrz's posts visible on his profile were
+    never appearing on bgnews.
+    """
     if not url:
         return url
-    # Strip query params for dedup purposes
-    return url.split('?')[0]
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        kept = {}
+        for key in ('fbid', 'v', 'story_fbid', 'id'):
+            if key in qs and qs[key]:
+                kept[key] = qs[key][0]
+        new_query = urlencode(kept) if kept else ''
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                           parsed.params, new_query, ''))
+    except Exception:
+        # Defensive: if URL is malformed, fall back to the old behaviour
+        return url.split('?')[0]
 
 
 def parse_fb_posts(html: str, source_url: str, source_name: str) -> list:
