@@ -3021,33 +3021,59 @@ def _mark_alerts_posted(warnings: list) -> None:
 # RCB ALERT — MAP COMPOSITION + PUBLISH
 # ============================================
 
-def _compose_bg_alert_map(districts_data: list, warnings: list) -> str:
-    """Build the bg alert map image from scratch:
-      1. Load map_storm.png as base
-      2. Composite stormRCB2transpartentBCKG.png at (RCB_OVERLAY_X, Y) size RCB_OVERLAY_W
-      3. Draw district temperatures in Scarlet
-      4. Add charity overlay
-      5. Add footer
-      6. Save to output/
+# Event-type → "is storm-themed" classifier (mirrors wch). Storm cloud
+# overlay only justified for these events. Overlaying it on a HEAT alert
+# (Upał) is visually wrong (user feedback 2026-06-26). Other event types
+# fall back to a sunny/cloudy base depending on time of day, without
+# overlay, until dedicated event-type icons exist.
+RCB_STORM_THEMED_EVENTS = {"Burze", "Burze z gradem", "Trąby powietrzne"}
 
-    Returns path to saved PNG.
+
+def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
+    """Build the bg alert map image from scratch.
+
+    Visual decision based on PRIMARY warning event type (warnings[0]):
+      - Storm-themed event (Burze etc.): map_storm.png + storm cloud overlay
+      - Other (Upał, Mróz, Silny wiatr…): map_sun.png or map_moon.png based
+        on time of day, NO storm overlay
+    Temperatures always in Scarlet (alert visual signal). Banner + cards
+    are added separately by compose_alert_top().
+
+    Returns (path, min_t, max_t).
     """
     output_path = PROJECT_ROOT / "output" / OUTPUT_IMAGE_FILENAME
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    base_path = MAPS_DIR / RCB_ALERT_STORM_BASE
-    overlay_path = MAPS_DIR / RCB_ALERT_STORM_OVERLAY
+    primary_event = (warnings[0].get('nazwa_zdarzenia', '') if warnings else '')
+    use_storm_visual = primary_event in RCB_STORM_THEMED_EVENTS
+    is_night = get_forecast_mode() == 'night'
+
+    if use_storm_visual:
+        base_filename = RCB_ALERT_STORM_BASE  # map_storm.png
+        logger.info(f"🚨 RCB ALERT MAP (Burze-themed): {base_filename} + storm overlay")
+    else:
+        base_filename = "map_moon.png" if is_night else "map_sun.png"
+        logger.info(f"🚨 RCB ALERT MAP ({primary_event!r}): {base_filename} (no overlay)")
+
+    base_path = MAPS_DIR / base_filename
+    if not base_path.exists():
+        logger.warning(f"⚠️ {base_path} missing — falling back to map_cloud.png")
+        base_path = MAPS_DIR / "map_cloud.png"
 
     base = Image.open(base_path).convert('RGBA')
-    if overlay_path.exists():
-        overlay = Image.open(overlay_path).convert('RGBA')
-        oh = int(overlay.size[1] * (RCB_OVERLAY_W / overlay.size[0]))
-        overlay = overlay.resize((RCB_OVERLAY_W, oh), Image.LANCZOS)
-        base.alpha_composite(overlay, dest=(RCB_OVERLAY_X, RCB_OVERLAY_Y))
-        logger.info(f"✅ Alert overlay {RCB_OVERLAY_W}×{oh} composited at "
-                    f"({RCB_OVERLAY_X}, {RCB_OVERLAY_Y})")
-    else:
-        logger.warning(f"⚠️ Storm overlay {overlay_path} missing — base only")
+
+    # Storm overlay ONLY for storm-themed events
+    if use_storm_visual:
+        overlay_path = MAPS_DIR / RCB_ALERT_STORM_OVERLAY
+        if overlay_path.exists():
+            overlay = Image.open(overlay_path).convert('RGBA')
+            oh = int(overlay.size[1] * (RCB_OVERLAY_W / overlay.size[0]))
+            overlay = overlay.resize((RCB_OVERLAY_W, oh), Image.LANCZOS)
+            base.alpha_composite(overlay, dest=(RCB_OVERLAY_X, RCB_OVERLAY_Y))
+            logger.info(f"✅ Storm overlay {RCB_OVERLAY_W}×{oh} composited at "
+                        f"({RCB_OVERLAY_X}, {RCB_OVERLAY_Y})")
+        else:
+            logger.warning(f"⚠️ Storm overlay {overlay_path} missing — base only")
 
     draw = ImageDraw.Draw(base)
     font_temp = get_font(55, bold=True)
