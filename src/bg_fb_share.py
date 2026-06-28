@@ -52,6 +52,20 @@ SHARED_POSTS_FILE = PROJECT_ROOT / "data" / "shared_posts.json"
 # changed back or we shipped a selector fix.
 FAILED_SHARES_FILE = PROJECT_ROOT / "data" / "failed_shares.json"
 FAILED_SHARE_RETRY_HOURS = 24
+
+# Max posts to harvest from a single source per scrape run. Prevents
+# accidental burst (e.g. fresh deploy seeing 20 posts from one source
+# would try to share all of them in a single run, risking FB antispam
+# flag). At steady state most sources have 0-1 new posts per cron so
+# this cap is rarely hit; on first deploy it bounds the catch-up.
+MAX_POSTS_PER_SOURCE = 3
+
+# URLs that require authentication to scrape (FB blocks unauth Playwright
+# from reading them). Detected by URL pattern: profile.php?id=... maps to
+# "new pages experience" profiles which behave differently than /handle/
+# pages in unauth scraping. Routed through Selenium auth path instead.
+def _requires_auth_scrape(url: str) -> bool:
+    return 'profile.php?id=' in url
 LOCK_FILE = PROJECT_ROOT / "locks" / "fb_share.lock"
 DEBUG_DIR = PROJECT_ROOT / "debug"
 
@@ -376,6 +390,12 @@ def parse_fb_posts(html: str, source_url: str, source_name: str) -> list:
             'source_url': source_url,
             'scraped_at': datetime.now().isoformat(),
         })
+        # Cap to avoid harvesting a long tail in a single scrape — keeps
+        # share-burst bounded. Dedupe layer prevents older posts from
+        # being missed permanently: they'll surface on subsequent runs
+        # once the cap-cutoff ones get marked-shared.
+        if len(posts) >= MAX_POSTS_PER_SOURCE:
+            break
 
     return posts
 
@@ -399,10 +419,12 @@ async def scrape_fb_page(page_url: str, page_name: str) -> list:
             await page.goto(page_url, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(3000)
 
-            # Scroll down to load more posts
-            for _ in range(3):
-                await page.evaluate("window.scrollBy(0, 800)")
-                await page.wait_for_timeout(1500)
+            # Scroll generously to give FB time to lazy-load multiple posts
+            # (more iterations + longer waits = more aria-posinset divs
+            # rendered, up to MAX_POSTS_PER_SOURCE which the parser caps).
+            for _ in range(6):
+                await page.evaluate("window.scrollBy(0, 1000)")
+                await page.wait_for_timeout(2000)
 
             html = await page.content()
             await browser.close()
@@ -417,14 +439,24 @@ async def scrape_fb_page(page_url: str, page_name: str) -> list:
 
 
 async def scrape_all_monitored_pages() -> list:
-    """Scrape all monitored Facebook pages for recent posts."""
-    all_posts = []
+    """Scrape monitored Facebook pages via Playwright unauth.
 
-    for page_config in MONITORED_PAGES:
+    SKIPS sources flagged as _requires_auth_scrape (profile.php?id=…),
+    those are scraped separately by scrape_all_auth_pages() once the
+    Selenium driver is up — Playwright unauth gets blocked on them and
+    returns 0 posts deterministically.
+    """
+    all_posts = []
+    unauth_sources = [s for s in MONITORED_PAGES if not _requires_auth_scrape(s['url'])]
+    auth_sources_count = len(MONITORED_PAGES) - len(unauth_sources)
+
+    for page_config in unauth_sources:
         posts = await scrape_fb_page(page_config['url'], page_config['name'])
         all_posts.extend(posts)
 
-    logger.info(f"Total scraped: {len(all_posts)} post(s) from {len(MONITORED_PAGES)} page(s)")
+    logger.info(f"Total scraped (unauth): {len(all_posts)} post(s) from "
+                f"{len(unauth_sources)} page(s); {auth_sources_count} auth-required "
+                f"source(s) deferred to Selenium phase")
     return all_posts
 
 
@@ -460,6 +492,51 @@ def scrape_fb_group_with_selenium(driver, group_url: str, group_name: str) -> li
     except Exception as e:
         logger.error(f"  Error scraping group {group_name}: {e}")
         return []
+
+
+def scrape_fb_page_with_selenium(driver, page_url: str, page_name: str) -> list:
+    """Scrape recent posts from a Facebook PAGE using the authenticated
+    Selenium driver.
+
+    Mirror of scrape_fb_group_with_selenium — same parse_fb_posts() logic
+    (aria-posinset markers work for both groups, profile.php pages, and
+    /handle/ pages). Used for sources where Playwright unauth gets
+    blocked / returns 0 posts (typically profile.php?id=... — i.e. "new
+    pages experience" profiles like Burmistrz Daniel Lubiński or Straż
+    Miejska Boguszów-Gorce).
+    """
+    logger.info(f"Scraping (auth): {page_name} ({page_url})")
+    try:
+        driver.get(page_url)
+        time.sleep(4)
+        # Scroll generously — admin/auth view often lazy-loads even more
+        # aggressively than unauth, but we need MAX_POSTS_PER_SOURCE rendered
+        for _ in range(5):
+            driver.execute_script("window.scrollBy(0, 900)")
+            time.sleep(1.5)
+        html = driver.page_source
+        posts = parse_fb_posts(html, page_url, page_name)
+        logger.info(f"  Found {len(posts)} post(s) from {page_name}")
+        return posts
+    except Exception as e:
+        logger.error(f"  Error scraping page {page_name}: {e}")
+        return []
+
+
+def scrape_all_auth_pages(driver) -> list:
+    """Scrape all MONITORED_PAGES entries flagged as auth-required
+    (profile.php?id=...) using the given Selenium driver. Sequential,
+    with small human_delay between sources."""
+    auth_sources = [s for s in MONITORED_PAGES if _requires_auth_scrape(s['url'])]
+    if not auth_sources:
+        return []
+    logger.info(f"--- Phase 2b: Auth scrape of {len(auth_sources)} profile.php source(s) ---")
+    all_posts = []
+    for cfg in auth_sources:
+        posts = scrape_fb_page_with_selenium(driver, cfg['url'], cfg['name'])
+        all_posts.extend(posts)
+        human_delay(2, 4)
+    return all_posts
 
 
 def scrape_all_monitored_groups(driver) -> list:
@@ -963,11 +1040,12 @@ def main():
     if page_skipped > 0:
         logger.info(f"Pages: skipped {page_skipped} already-shared post(s)")
 
-    # Early exit only if BOTH no new page posts AND no groups configured.
-    # When MONITORED_GROUPS is non-empty we still need to spin up Selenium
-    # to scrape them (authenticated) before deciding.
-    if not new_page_posts and not MONITORED_GROUPS:
-        logger.info("No new posts to share and no groups configured.")
+    # Early exit only if NO unauth page posts AND no groups AND no
+    # auth-required pages — i.e. truly nothing to do that requires
+    # spinning up Selenium.
+    has_auth_pages = any(_requires_auth_scrape(s['url']) for s in MONITORED_PAGES)
+    if not new_page_posts and not MONITORED_GROUPS and not has_auth_pages:
+        logger.info("No new posts to share and no groups/auth pages configured.")
         return
 
     if TEST_MODE and not MONITORED_GROUPS:
@@ -989,8 +1067,29 @@ def main():
             logger.error("Could not verify page login. Aborting.")
             return
 
-        # Step 6: Authenticated group scrape (uses same driver)
+        # Step 6: Authenticated scrape of profile.php pages (Burmistrz,
+        # Straż Miejska, etc.) — Playwright unauth couldn't see them
         new_posts = list(new_page_posts)
+        auth_page_posts = scrape_all_auth_pages(driver)
+        new_auth_posts = []
+        auth_already_skipped = 0
+        auth_failed_skipped = 0
+        for p in auth_page_posts:
+            nu = normalize_post_url(p['url'])
+            if nu in shared_posts:
+                auth_already_skipped += 1
+                continue
+            if nu in failed_shares:
+                auth_failed_skipped += 1
+                continue
+            new_auth_posts.append(p)
+        if auth_already_skipped > 0:
+            logger.info(f"Auth pages: skipped {auth_already_skipped} already-shared post(s)")
+        if auth_failed_skipped > 0:
+            logger.info(f"Auth pages: skipped {auth_failed_skipped} post(s) failed recently")
+        new_posts.extend(new_auth_posts)
+
+        # Step 6b: Authenticated group scrape (uses same driver)
         if MONITORED_GROUPS:
             logger.info(f"--- Phase 2a: Scraping {len(MONITORED_GROUPS)} group(s) (authenticated) ---")
             group_posts = scrape_all_monitored_groups(driver)
