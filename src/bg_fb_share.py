@@ -84,6 +84,7 @@ MONITORED_PAGES = [
     {"name": "Stajnia Boguszow",                   "url": "https://www.facebook.com/stajniaboguszow"},
     # --- Local establishments ---
     {"name": "Stodola Dzika",                      "url": "https://www.facebook.com/StodolaDzika"},
+    {"name": "Osrodek Gora Dzikowiec",             "url": "https://www.facebook.com/OSRDzikowiec"},
     # --- Religious communities ---
     {"name": "Kosciol Uliczny Boguszow-Gorce",     "url": "https://www.facebook.com/profile.php?id=100067837419514"},
     # --- TODO: WEBSITE sources (non-FB) handled by bg_scraper_selenium.py
