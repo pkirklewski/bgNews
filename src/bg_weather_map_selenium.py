@@ -1596,85 +1596,94 @@ def _derive_verification_needle(caption: str) -> str:
 
 
 def verify_post_published_and_get_url(driver, verify_needle: str,
-                                       timeout: int = 15) -> str:
-    """STRICT post-publish verification.
+                                       timeout: int = 20) -> str:
+    """STRICT post-publish verification — TOP-OF-FEED approach (mirror of wch).
 
-    Navigates to FB_PAGE_URL and looks for verify_needle in the rendered DOM.
-    If found, extracts the specific post's permalink URL. Two layout modes
-    are supported:
+    OLD approach (broken, 2026-06-21..28): searched the ENTIRE rendered DOM
+    for `verify_needle` then walked ancestors looking for a permalink. This
+    false-negative'd constantly because the needle matched widget panels,
+    sidebar reshares, monitored-pages snippets, etc. — places without a
+    proper permalink anchor → returned None → publish flagged as failed
+    → hourly cron looped (15× failed attempts in a single day on wch).
 
-    (1) Public view → direct /posts/<id> or /permalink/ anchors
-    (2) Page-admin view (logged in as page) → no direct permalink anchors;
-        reconstruct facebook.com/<page_id>/posts/<post_id> from the
-        target_id + page_id query params of the boost-post URL that admin
-        view DOES render on each post.
-
-    Returns the post URL string on success, None on failure. Callers MUST
-    treat None as "publish actually failed" and skip downstream sharing —
-    falling back to FB_PAGE_URL is the historical 2026-06-20 bug that
-    caused 5 wch groups to receive an unrelated TVWALBRZYCH 'Riese'
-    article reshare with our IMGW alert caption attached.
+    NEW approach: only look at posts in the page's actual FEED, ordered
+    newest-first via FB's aria-posinset attribute. Check top 3 (admin view
+    sometimes intersperses widgets so posinset=1 isn't always our just-
+    published post). Extract permalink from the SAME container where the
+    needle was found.
     """
     try:
-        logger.info(f"🔎 Verifying post on page — needle: {verify_needle!r}")
+        logger.info(f"🔎 Verifying post (top-of-feed) — needle: {verify_needle!r}")
         driver.get(FB_PAGE_URL)
-        human_delay(4, 6)
-
-        if "'" in verify_needle and '"' in verify_needle:
-            logger.warning("⚠️ Needle contains both quote types — using partial match")
-            verify_needle = verify_needle.replace("'", " ").replace('"', ' ')
-        xpath_lit = f'"{verify_needle}"' if "'" in verify_needle else f"'{verify_needle}'"
+        human_delay(5, 7)
 
         try:
-            needle_el = WebDriverWait(driver, timeout).until(
-                EC.presence_of_element_located(
-                    (By.XPATH, f"//*[contains(text(), {xpath_lit})]")
-                )
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.XPATH, "//div[@aria-posinset]"))
             )
-            logger.info("✅ Needle found on page")
         except TimeoutException:
-            logger.error(f"❌ Post verification FAILED — needle {verify_needle!r} "
-                         f"not present on page within {timeout}s after publish.")
-            driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_needle_missing.png"))
+            logger.error(f"❌ No posts (aria-posinset) rendered within {timeout}s")
+            driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_no_feed.png"))
             return None
+
+        # Scroll a bit to trigger lazy-load of top posts (admin view often
+        # renders only 1 post container initially).
+        for _ in range(2):
+            driver.execute_script("window.scrollBy(0, 700)")
+            human_delay(1.5, 2.5)
+        driver.execute_script("window.scrollTo(0, 0)")
+        human_delay(1, 2)
+
+        posts = driver.find_elements(By.XPATH, "//div[@aria-posinset]")
+        try:
+            posts.sort(key=lambda p: int(p.get_attribute('aria-posinset') or 9999))
+        except Exception:
+            pass
+        logger.info(f"   Found {len(posts)} post container(s); checking top 3")
 
         import re
         TARGET_ID_RE = re.compile(r'[?&]target_id=(\d+)')
         PAGE_ID_RE = re.compile(r'[?&]page_id=(\d+)')
 
-        for levels in range(1, 16):
+        for i, post in enumerate(posts[:3]):
+            # Use JS innerText — `.text` returns CSS-shadow noise on modern
+            # FB admin view (verified bug, 2026-06-28).
             try:
-                xpath_up = "./" + ("../" * levels) + "."
-                ancestor = needle_el.find_element(By.XPATH, xpath_up)
-                all_links = ancestor.find_elements(By.XPATH, ".//a[@href]")
-                for link in all_links:
-                    href = link.get_attribute('href') or ''
-                    if any(skip in href for skip in ('comment_id', 'notif_id', '/groups/',
-                                                     '/ad_center/', '/photo/')):
-                        continue
-                    if any(k in href for k in ('/posts/', '/permalink/', 'permalink.php')):
-                        clean_url = href.split('&__tn__')[0].split('&__cft__')[0]
-                        logger.info(f"✅ Post permalink extracted (direct): {clean_url}")
-                        return clean_url
-                target_id = page_id = None
-                for link in all_links:
-                    href = link.get_attribute('href') or ''
-                    if '/ad_center/' in href and 'target_id=' in href:
-                        m_t = TARGET_ID_RE.search(href)
-                        m_p = PAGE_ID_RE.search(href)
-                        if m_t and m_p:
-                            target_id, page_id = m_t.group(1), m_p.group(1)
-                            break
-                if target_id and page_id:
-                    reconstructed = f"https://www.facebook.com/{page_id}/posts/{target_id}"
-                    logger.info(f"✅ Post permalink reconstructed from admin-view IDs: {reconstructed}")
-                    return reconstructed
+                post_text = driver.execute_script(
+                    "return arguments[0].innerText || ''", post) or ''
             except Exception:
                 continue
+            if verify_needle not in post_text:
+                logger.info(f"   post[{i}] posinset={post.get_attribute('aria-posinset')}: "
+                            f"needle NOT in innerText (len={len(post_text)})")
+                continue
+            logger.info(f"✅ Needle matched in post[{i}] "
+                        f"posinset={post.get_attribute('aria-posinset')}")
+            links = post.find_elements(By.XPATH, ".//a[@href]")
+            for link in links:
+                href = link.get_attribute('href') or ''
+                if any(skip in href for skip in ('comment_id', 'notif_id', '/groups/',
+                                                  '/ad_center/', '/photo/')):
+                    continue
+                if any(k in href for k in ('/posts/', '/permalink/', 'permalink.php')):
+                    clean_url = href.split('&__tn__')[0].split('&__cft__')[0]
+                    logger.info(f"✅ Permalink (direct): {clean_url}")
+                    return clean_url
+            for link in links:
+                href = link.get_attribute('href') or ''
+                if '/ad_center/' in href and 'target_id=' in href:
+                    m_t = TARGET_ID_RE.search(href)
+                    m_p = PAGE_ID_RE.search(href)
+                    if m_t and m_p:
+                        reconstructed = (f"https://www.facebook.com/"
+                                         f"{m_p.group(1)}/posts/{m_t.group(1)}")
+                        logger.info(f"✅ Permalink (admin-view reconstruct): {reconstructed}")
+                        return reconstructed
+            logger.warning(f"Needle matched in top post but no permalink in container")
 
-        logger.error("❌ Needle found but no permalink derivable. "
-                     "Refusing to share to avoid wrong-post fallback.")
-        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_no_permalink.png"))
+        logger.error(f"❌ Needle {verify_needle!r} not in top 3 posts. "
+                     f"Publish presumed to have failed.")
+        driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_needle_missing.png"))
         return None
     except Exception as e:
         logger.error(f"❌ verify_post_published_and_get_url crashed: {e}")
