@@ -2992,11 +2992,19 @@ def _load_posted_alerts() -> dict:
 
 
 def _save_posted_alerts(state: dict) -> None:
-    import json
+    """Atomic save: write to .tmp then os.replace so a crashed/killed
+    process can never leave the state file truncated. Critical for the
+    MAX_ATTEMPTS_PER_WARNING_ID guarantee — if the file got corrupted
+    mid-write, _load_posted_alerts would reset to {} on next tick and
+    the attempts counter would restart from 0.
+    """
+    import json, os
     RCB_ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    RCB_ALERT_STATE_FILE.write_text(
+    tmp_path = RCB_ALERT_STATE_FILE.with_suffix(RCB_ALERT_STATE_FILE.suffix + ".tmp")
+    tmp_path.write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    os.replace(tmp_path, RCB_ALERT_STATE_FILE)  # atomic on POSIX
 
 
 def _prune_posted_alerts(state: dict, grace_hours: int = 48) -> dict:
