@@ -1611,6 +1611,12 @@ def verify_post_published_and_get_url(driver, verify_needle: str,
     sometimes intersperses widgets so posinset=1 isn't always our just-
     published post). Extract permalink from the SAME container where the
     needle was found.
+
+    Returns tuple (found_on_page, url):
+      (True, "<url>") — verified + URL extracted (group share OK)
+      (True, None)    — needle confirmed but FB hasn't lazy-loaded the
+                        boost-post URL yet. Mark state, skip group share.
+      (False, None)   — needle not found, true publish failure. Retry next hour.
     """
     try:
         logger.info(f"🔎 Verifying post (top-of-feed) — needle: {verify_needle!r}")
@@ -1624,7 +1630,7 @@ def verify_post_published_and_get_url(driver, verify_needle: str,
         except TimeoutException:
             logger.error(f"❌ No posts (aria-posinset) rendered within {timeout}s")
             driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_no_feed.png"))
-            return None
+            return (False, None)
 
         # Scroll a bit to trigger lazy-load of top posts (admin view often
         # renders only 1 post container initially).
@@ -1668,7 +1674,7 @@ def verify_post_published_and_get_url(driver, verify_needle: str,
                 if any(k in href for k in ('/posts/', '/permalink/', 'permalink.php')):
                     clean_url = href.split('&__tn__')[0].split('&__cft__')[0]
                     logger.info(f"✅ Permalink (direct): {clean_url}")
-                    return clean_url
+                    return (True, clean_url)
             for link in links:
                 href = link.get_attribute('href') or ''
                 if '/ad_center/' in href and 'target_id=' in href:
@@ -1678,17 +1684,21 @@ def verify_post_published_and_get_url(driver, verify_needle: str,
                         reconstructed = (f"https://www.facebook.com/"
                                          f"{m_p.group(1)}/posts/{m_t.group(1)}")
                         logger.info(f"✅ Permalink (admin-view reconstruct): {reconstructed}")
-                        return reconstructed
-            logger.warning(f"Needle matched in top post but no permalink in container")
+                        return (True, reconstructed)
+            # Needle confirmed but no permalink (FB lazy-load) — mark state
+            # to break the republish loop; skip group share.
+            logger.warning(f"Needle matched in post[{i}] but no permalink yet. "
+                           f"Returning (True, None) — state will mark, share skipped.")
+            return (True, None)
 
         logger.error(f"❌ Needle {verify_needle!r} not in top 3 posts. "
                      f"Publish presumed to have failed.")
         driver.save_screenshot(str(PROJECT_ROOT / "debug" / "debug_verify_needle_missing.png"))
-        return None
+        return (False, None)
     except Exception as e:
         logger.error(f"❌ verify_post_published_and_get_url crashed: {e}")
         import traceback; traceback.print_exc()
-        return None
+        return (False, None)
 
 
 def post_to_facebook_selenium(driver, image_path: str, caption: str,
@@ -2053,11 +2063,18 @@ def post_to_facebook_selenium(driver, image_path: str, caption: str,
             # groups. Refuse to report success unless we find a unique needle
             # AND extract the specific post permalink.
             needle = verify_needle or _derive_verification_needle(caption)
-            post_url = verify_post_published_and_get_url(driver, needle)
-            if not post_url:
+            found_on_page, post_url = verify_post_published_and_get_url(driver, needle)
+            if not found_on_page:
                 logger.error("❌ Post NOT verified on page — refusing to report success "
                              "to prevent downstream wrong-post sharing.")
                 return False, None
+            if post_url is None:
+                # Post IS on page (needle confirmed) but FB lazy-load hasn't
+                # surfaced the boost-post URL. Report success so caller marks
+                # state & breaks republish loop; caller skips group share.
+                logger.warning("⚠️  Post verified but URL not extractable yet (FB lazy-load). "
+                               "State will be marked; group share skipped.")
+                return True, None
 
             logger.info(f"✅ Post published AND verified on page!  URL: {post_url}")
             return True, post_url
@@ -3275,9 +3292,19 @@ Więcej: {FB_PROFILE_LINK}
             driver, map_path, caption,
             verify_needle=verify_needle, test_mode=False,
         )
-        if not success or not page_post_url:
+        if not success:
             logger.error("Alert page post failed verification — NOT updating state.")
             return False
+
+        if not page_post_url:
+            # Post IS on page but URL not yet extractable (FB lazy-load).
+            # Mark state to STOP the hourly republish loop; skip group
+            # share and Straż Miejska wall (no URL to share/post-as-link).
+            logger.warning(f"✅ Alert post on page but URL not extractable. "
+                           f"Marking state to break loop; skipping group share "
+                           f"and profile-wall distribution.")
+            _mark_alerts_posted(warnings)
+            return True
 
         logger.info(f"✅ Alert published + verified: {page_post_url}")
 
