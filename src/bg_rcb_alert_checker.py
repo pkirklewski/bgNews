@@ -67,9 +67,16 @@ def main():
               f"all already posted — skip. IDs: {wids}")
         return 0
 
-    new_ids = [w.get('id') for w in new_warnings]
-    print(f"[bg_rcb_alert_checker] {len(new_warnings)} NEW warning(s) — "
-          f"publishing alert. New IDs: {new_ids}")
+    new_ids = [x.get('id') for x in new_warnings]
+    print(f"[bg_rcb_alert_checker] {len(new_warnings)} warning(s) to attempt "
+          f"(NEW or under retry cap). IDs: {new_ids}")
+
+    # CRITICAL: increment attempts counter BEFORE publish_rcb_alert_only.
+    # This persists the attempt even if publish crashes mid-way, so the
+    # MAX_ATTEMPTS_PER_WARNING_ID safety cap can eventually break the loop.
+    # Without this, a verify-flaky warning would loop forever (the 14× spam
+    # incident of 2026-06-29).
+    bg._record_publish_attempt(new_warnings)
 
     success = bg.publish_rcb_alert_only(all_active)
 
@@ -79,7 +86,8 @@ def main():
         return 0
     else:
         print(f"[bg_rcb_alert_checker] ❌ Alert publish FAILED — "
-              f"state NOT updated; next hour will retry")
+              f"attempts counter incremented; will retry up to "
+              f"MAX_ATTEMPTS_PER_WARNING_ID={bg.MAX_ATTEMPTS_PER_WARNING_ID} times total")
         return 1
 
 

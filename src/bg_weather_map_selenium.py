@@ -3014,17 +3014,56 @@ def _prune_posted_alerts(state: dict, grace_hours: int = 48) -> dict:
     return pruned
 
 
+# HARD SAFETY CAP — even if verify keeps falsely failing, we will NEVER
+# publish more than this many times for a given warning ID. After hitting
+# the cap, the ID is treated as posted (auto-given-up) and the hourly
+# cron stops retrying. Worst case: 2 duplicates on FB page. Best case
+# (verify works): 1 post. Either way: bounded, never the 14× spam loop
+# we had on 2026-06-29.
+MAX_ATTEMPTS_PER_WARNING_ID = 2
+
+
 def get_new_imgw_alerts() -> tuple:
-    """Returns (new_warnings, all_active_warnings). See wch counterpart."""
+    """Hourly-check helper. Returns (warnings_to_attempt, all_active).
+
+    A warning is "to attempt" if:
+      - Not in posted_alerts.json at all (never tried before), OR
+      - In state without 'posted_at' marker AND attempts <
+        MAX_ATTEMPTS_PER_WARNING_ID (still has retry budget).
+
+    A warning is SKIPPED (returned in all_active but not in to_attempt) if:
+      - 'posted_at' is set (definitively published successfully), OR
+      - 'attempts' has reached MAX_ATTEMPTS_PER_WARNING_ID (gave up after
+        the cap — auto-promoted to "posted" status to break the loop).
+    """
     all_active = fetch_imgw_warnings(IMGW_TERYT_CODES)
     if not all_active:
         return ([], [])
     state = _load_posted_alerts()
-    new = [w for w in all_active if w.get('id') not in state]
-    return (new, all_active)
+    to_attempt = []
+    for w in all_active:
+        wid = w.get('id')
+        entry = state.get(wid)
+        if not entry:
+            to_attempt.append(w)
+            continue
+        if entry.get('posted_at'):
+            continue  # definitively done
+        attempts = int(entry.get('attempts', 0))
+        if attempts >= MAX_ATTEMPTS_PER_WARNING_ID:
+            continue  # gave up after cap, treat as done
+        to_attempt.append(w)
+    return (to_attempt, all_active)
 
 
-def _mark_alerts_posted(warnings: list) -> None:
+def _record_publish_attempt(warnings: list) -> None:
+    """Increment the attempts counter for each warning ID. Call this
+    BEFORE attempting publish_rcb_alert_only. Pairs with
+    _mark_alerts_posted() which sets posted_at on success.
+
+    Even if publish later fails, the attempts counter is now persisted
+    so MAX_ATTEMPTS_PER_WARNING_ID can eventually break the loop.
+    """
     state = _load_posted_alerts()
     state = _prune_posted_alerts(state)
     now_iso = datetime.now().isoformat()
@@ -3032,12 +3071,45 @@ def _mark_alerts_posted(warnings: list) -> None:
         wid = w.get('id')
         if not wid:
             continue
+        entry = state.get(wid, {})
+        attempts = int(entry.get('attempts', 0)) + 1
         state[wid] = {
             'nazwa_zdarzenia': w.get('nazwa_zdarzenia'),
             'stopien': w.get('stopien'),
             'prawdopodobienstwo': w.get('prawdopodobienstwo'),
             'obowiazuje_od': w.get('obowiazuje_od'),
             'obowiazuje_do': w.get('obowiazuje_do'),
+            'attempts': attempts,
+            'first_attempt_at': entry.get('first_attempt_at', now_iso),
+            'last_attempt_at': now_iso,
+            # NOTE: posted_at intentionally NOT set here — only on confirmed success.
+            # If entry already has posted_at (rare race), preserve it:
+            **({'posted_at': entry['posted_at']} if entry.get('posted_at') else {}),
+        }
+    _save_posted_alerts(state)
+
+
+def _mark_alerts_posted(warnings: list) -> None:
+    """Mark warnings as DEFINITIVELY POSTED (sets posted_at marker).
+    After this, get_new_imgw_alerts() will skip them permanently
+    (until pruned by TTL). Call on confirmed publish success."""
+    state = _load_posted_alerts()
+    state = _prune_posted_alerts(state)
+    now_iso = datetime.now().isoformat()
+    for w in warnings:
+        wid = w.get('id')
+        if not wid:
+            continue
+        entry = state.get(wid, {})
+        state[wid] = {
+            'nazwa_zdarzenia': w.get('nazwa_zdarzenia'),
+            'stopien': w.get('stopien'),
+            'prawdopodobienstwo': w.get('prawdopodobienstwo'),
+            'obowiazuje_od': w.get('obowiazuje_od'),
+            'obowiazuje_do': w.get('obowiazuje_do'),
+            'attempts': int(entry.get('attempts', 1)),  # at least 1
+            'first_attempt_at': entry.get('first_attempt_at', now_iso),
+            'last_attempt_at': now_iso,
             'posted_at': now_iso,
         }
     _save_posted_alerts(state)
