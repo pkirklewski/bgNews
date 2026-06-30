@@ -788,6 +788,94 @@ def ensure_logged_in_as_page(driver):
     return True
 
 
+def _extract_post_identifier(url: str) -> str:
+    """Extract a unique-enough identifier from a source post URL — used
+    as a DOM needle to grep our own wall after a share, to confirm the
+    embed actually landed. Returns None if no identifier is recognisable.
+
+    Match priority (most specific first):
+      /posts/pfbid<hash>     → 'pfbid<hash>'
+      /photo?fbid=<digits>   → '<digits>'
+      /reel/<digits>         → '<digits>'
+      /watch?v=<digits>      → '<digits>'
+      /videos/<digits>       → '<digits>'
+    """
+    if not url:
+        return None
+    m = re.search(r'pfbid[A-Za-z0-9_-]+', url)
+    if m:
+        return m.group(0)
+    m = re.search(r'[?&]fbid=(\d+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'/reel/(\d+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'[?&]v=(\d+)', url)
+    if m:
+        return m.group(1)
+    m = re.search(r'/videos/(\d+)', url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def verify_share_succeeded(driver, post: dict, scroll_rounds: int = 4) -> bool:
+    """Navigate to bgnews own wall and confirm the just-shared post is
+    actually visible there. Closes the "No confirmation toast after 30s,
+    assuming share completed" false-positive loophole.
+
+    Background — diagnosis 2026-06-30:
+      live wall scrape of bgnews showed that 7 of 8 "Successfully shared"
+      posts from the 11:30 cron run were NOT actually on the wall. The
+      script clicks "Udostępnij w Aktualnościach", waits 30s for a toast
+      that almost never appears (645/655 = 98.5% of "successes" log
+      "No confirmation toast"), then assumes success and writes to
+      shared_posts.json — permanently blocking that URL from retry.
+
+    Detection strategy:
+      Extract a unique identifier from the source URL (pfbid hash or
+      photo fbid). Navigate to FB_PAGE_URL (our own wall). Scroll a
+      few times so the top of feed renders. Search the rendered HTML
+      for the identifier — if found, the embed is on our wall.
+
+    Failure modes & policy:
+      - identifier not extractable    → return True (fail-open: rare,
+        no need to penalise an unusual URL format we can't probe)
+      - navigation / scrape exception → return False (fail-closed:
+        if verification couldn't run, the share probably hit similar
+        FB-side trouble; retry is the safer default)
+      - identifier extractable but not in DOM → return False
+    """
+    identifier = _extract_post_identifier(post['url'])
+    if not identifier:
+        logger.info(f"  ⚠️ Verify skipped — no extractable identifier in {post['url']}")
+        return True
+
+    needle = identifier
+    logger.info(f"  🔎 Verifying share on bgnews wall — needle: '{needle}'")
+    try:
+        driver.get(FB_PAGE_URL)
+        time.sleep(5)
+        for _ in range(scroll_rounds):
+            driver.execute_script("window.scrollBy(0, 1000)")
+            time.sleep(1.5)
+        html = driver.page_source
+        if needle in html:
+            logger.info(f"  ✅ Verified: needle '{needle}' present on bgnews wall")
+            return True
+        logger.warning(f"  ❌ Verify FAILED: needle '{needle}' NOT on bgnews wall — share did not land")
+        try:
+            ts = int(time.time())
+            driver.save_screenshot(str(DEBUG_DIR / f"debug_verify_fail_{ts}.png"))
+        except Exception:
+            pass
+        return False
+    except Exception as e:
+        logger.error(f"  ⚠️ Verify exception (fail-closed): {e}")
+        return False
+
+
 def share_post(driver, post: dict) -> bool:
     """Share a single Facebook post to our page's feed.
 
@@ -800,7 +888,9 @@ def share_post(driver, post: dict) -> bool:
         post: Post dict with 'url', 'text_snippet', 'source_name'
 
     Returns:
-        True if shared successfully, False otherwise
+        True if shared AND verified on our wall, False otherwise.
+        Verification (via verify_share_succeeded) closes the
+        "No confirmation toast → assume success" loophole.
     """
     post_url = post['url']
     source_name = post['source_name']
@@ -988,7 +1078,18 @@ def share_post(driver, post: dict) -> bool:
             except Exception:
                 continue
 
-        logger.info(f"  Successfully shared post from {source_name}")
+        logger.info(f"  Clicked-through complete from {source_name} — running post-share verification")
+
+        # Critical: FB's share dialog often closes without raising any
+        # error even when the share itself was silently rejected (no
+        # confirmation toast, no exception). Confirm by checking our own
+        # wall for the source post's identifier. See verify_share_succeeded
+        # docstring for the 2026-06-30 diagnosis.
+        if not verify_share_succeeded(driver, post):
+            logger.warning(f"  ❌ Share from {source_name} did NOT verify — treating as failure")
+            return False
+
+        logger.info(f"  ✅ Successfully shared & verified post from {source_name}")
         return True
 
     except Exception as e:
