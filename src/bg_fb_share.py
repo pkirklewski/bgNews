@@ -788,6 +788,162 @@ def ensure_logged_in_as_page(driver):
     return True
 
 
+_PL_DIACRITIC_MAP = str.maketrans(
+    'ąćęłńóśźżĄĆĘŁŃÓŚŹŻ',
+    'acelnoszzACELNOSZZ',
+)
+
+
+def _strip_pl(s: str) -> str:
+    """Diacritic-insensitive comparison helper. FB displays page names
+    with proper Polish diacritics ('Boguszów-Gorce', 'Straż Miejska')
+    but our MONITORED_PAGES source_name fields are typed without diacritics
+    ('Boguszow-Gorce', 'Straz Miejska'). Strip both sides before substring
+    match to avoid a false miss."""
+    return (s or '').translate(_PL_DIACRITIC_MAP)
+
+
+def _click_robust(driver, el):
+    """Click an element, falling back to JS click if the native click
+    is intercepted (e.g. FB renders an <img> on top of the share button
+    region). Scrolls into view first to maximise the chance of a clean
+    native click."""
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});", el
+        )
+        time.sleep(0.4)
+    except Exception:
+        pass
+    try:
+        el.click()
+        return True
+    except Exception as e_native:
+        logger.info(f"  native click intercepted ({type(e_native).__name__}); falling back to JS click")
+    try:
+        driver.execute_script("arguments[0].click();", el)
+        return True
+    except Exception as e_js:
+        logger.error(f"  JS click also failed: {e_js}")
+        return False
+
+
+def _find_share_button_for_post(driver, post: dict, max_wait_s: int = 15):
+    """Locate the Share button for the SPECIFIC post we navigated to.
+
+    Real FB share buttons have aria-label starting with 'Udostępnij post '
+    (or 'Share post ') followed by the page name. A permalink page
+    often renders multiple posts (the target post + suggestions + other
+    pages' reshares of the same content), each with its own share button.
+    Topmost-by-y is unreliable: in the 2026-06-30 diagnosis FB rendered
+    Zespół Szkolno-Przedszkolny's reshare of a Gmina post ABOVE the Gmina
+    original on the permalink page, so topmost would have shared the wrong
+    page's post.
+
+    Resolution order:
+      1. precise — proper-button aria-label diacritic-insensitively contains
+         a distinctive source-name token (e.g. 'Gmina', 'Burmistrz', 'Stra')
+      2. fallback — proper-button aria-label diacritic-insensitively contains
+         the FULL stripped source_name as a substring
+      3. last resort — topmost proper-button (warn loud)
+      4. Reel / generic aria-label='Udostępnij' button
+      5. legacy 'Send this to friends...' aria-label
+
+    NO `<span>` text fallback — that was the original bug. Spans nested
+    inside the button bubble clicks up to the parent, but FB renders
+    span-text labels in DOM ORDER not matching visual order, so the
+    span fallback frequently selected the wrong post's button.
+    """
+    source_name = post.get('source_name', '') or ''
+    source_stripped = _strip_pl(source_name)
+    # Most distinctive tokens for our MONITORED_PAGES (first-word usually
+    # works: 'Gmina', 'Burmistrz', 'Straz', 'OSP', 'MBPCK', 'Zespol',
+    # 'OSiR', 'Gornik', 'HEROS', 'Stajnia', 'Stodola', 'Osrodek', 'Kosciol'.
+    # 'Boguszow-Gorce' appears in many so we use the FIRST distinctive
+    # word as the precise needle, falling back to full name match.)
+    distinctive_tokens = [w for w in source_stripped.split() if len(w) >= 4]
+
+    deadline = time.time() + max_wait_s
+    while time.time() < deadline:
+        # Collect ALL proper share buttons currently on the page
+        try:
+            xpath = (
+                "//div[@role='button' and "
+                "(starts-with(@aria-label, 'Udost\u0119pnij post ') or "
+                " starts-with(@aria-label, 'Share post '))]"
+            )
+            candidates = driver.find_elements(By.XPATH, xpath)
+        except Exception:
+            candidates = []
+
+        visible_buttons = []
+        for c in candidates:
+            try:
+                if not c.is_displayed():
+                    continue
+                label = c.get_attribute('aria-label') or ''
+                visible_buttons.append((c, label, _strip_pl(label), c.rect.get('y', 0)))
+            except Exception:
+                continue
+
+        # (1) precise — token match on stripped aria-label
+        for el, label, stripped, y in visible_buttons:
+            for tok in distinctive_tokens:
+                if tok in stripped:
+                    logger.info(f"  Found Share button (precise '{tok}'): {label!r}")
+                    return el
+
+        # (2) fallback — full source name as substring (stripped both sides)
+        if source_stripped:
+            for el, label, stripped, y in visible_buttons:
+                if source_stripped in stripped:
+                    logger.info(f"  Found Share button (fullname): {label!r}")
+                    return el
+
+        # (3) topmost — last resort, log a warning so we notice
+        if visible_buttons:
+            visible_buttons.sort(key=lambda t: t[3])
+            el, label, stripped, y = visible_buttons[0]
+            logger.warning(
+                f"  ⚠️ Source name '{source_name}' not found in any share-button aria-label; "
+                f"falling back to topmost (y={y:.0f}): {label!r} — risk of sharing wrong post"
+            )
+            return el
+
+        # (4) Reel / simpler aria-label
+        try:
+            xpath = (
+                "//div[@role='button' and "
+                "(@aria-label='Udost\u0119pnij' or @aria-label='Share')]"
+            )
+            reel_candidates = driver.find_elements(By.XPATH, xpath)
+            visible = [(c, c.rect.get('y', 0)) for c in reel_candidates if c.is_displayed()]
+            if visible:
+                visible.sort(key=lambda kv: kv[1])
+                el = visible[0][0]
+                logger.info(f"  Found Share button (Reel-style, y={visible[0][1]:.0f})")
+                return el
+        except Exception:
+            pass
+
+        # (5) legacy aria-labels
+        try:
+            xpath = (
+                "//div[@aria-label='Send this to friends or post it on your profile.' "
+                "or @aria-label='Wy\u015blij znajomym lub opublikuj na swoim profilu.']"
+            )
+            el = driver.find_element(By.XPATH, xpath)
+            if el.is_displayed():
+                logger.info("  Found Share button (legacy aria-label)")
+                return el
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    return None
+
+
 def _extract_post_identifier(url: str) -> str:
     """Extract a unique-enough identifier from a source post URL — used
     as a DOM needle to grep our own wall after a share, to confirm the
@@ -912,54 +1068,45 @@ def share_post(driver, post: dict) -> bool:
             driver.save_screenshot(str(DEBUG_DIR / "debug_share_login_required.png"))
             return False
 
-        # Step 2: Find and click the "Share" / "Udostepnij" button on the post
-        # Different post types render different share-button aria-labels:
-        #   - Regular post: aria-label='Send this to friends or post it on your profile.'
-        #   - Reel: aria-label='Udostępnij' (the simpler one)
-        #   - Photo: similar to regular post
-        # Order matters — try Reel-specific aria-label early so a Reel doesn't
-        # accidentally match a sidebar "Udostępnij" span first.
+        # Step 2: Find and click the "Share" / "Udostępnij" button on the post.
+        #
+        # Bug history (2026-06-30): the prior selector list ended with
+        # //span[text()='Udostępnij'] as a fallback. Inspection of a real
+        # FB post page (gminamiastoboguszowgorce/posts/pfbid…) showed
+        # FOUR matches for "Udostępnij" — two proper role=button divs
+        # (one for the main post we navigated to, one for a SUGGESTED
+        # post FB renders alongside) and two label spans nested inside
+        # each button. The span selector won the race in 669/669 = 100%
+        # of attempts because it matched IMMEDIATELY (no aria-label
+        # filtering) — and worst, it sometimes matched the SUGGESTED
+        # post's span first in DOM order. So we silently clicked the
+        # share button for SOME OTHER post (Koleje, etc.), then
+        # "Udostępnij w Aktualnościach" shared that random post — and
+        # verify for our intended pfbid hash on the wall correctly
+        # failed. Net effect: we were sharing the wrong posts (silently)
+        # and verify (added earlier today) caught it as zero-landing.
+        #
+        # Real share buttons:
+        #   <div role='button' aria-label='Udostępnij post <Page Name>'>
+        # The aria-label STARTS WITH 'Udostępnij post ' (note the space).
+        # We collect ALL matches and pick the one whose label contains
+        # the source page name; failing that, the TOPMOST one (smallest
+        # y) which is reliably the main post on a permalink page.
         is_reel = '/reel/' in post_url
         if is_reel:
-            logger.info("  Reel detected — using Reel-specific share selectors")
+            logger.info("  Reel detected — Reel share button has shorter aria-label")
         logger.info("  Looking for Share button...")
 
-        share_button_selectors = [
-            "//div[@aria-label='Send this to friends or post it on your profile.']",
-            "//div[@aria-label='Wy\u015blij znajomym lub opublikuj na swoim profilu.']",
-            # Reel uses a simpler aria-label — also generic 'Udostępnij' on photo posts
-            "//div[@aria-label='Udost\u0119pnij' and @role='button']",
-            "//div[@aria-label='Share' and @role='button']",
-            "//span[text()='Udost\u0119pnij']",
-            "//span[text()='Share']",
-        ]
-
-        share_btn = None
-        for selector in share_button_selectors:
-            try:
-                share_btn = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
-                if share_btn:
-                    logger.info(f"  Found Share button: {selector}")
-                    break
-            except Exception:
-                continue
+        share_btn = _find_share_button_for_post(driver, post)
 
         if not share_btn:
             logger.error("  Could not find Share button on the post")
             driver.save_screenshot(str(DEBUG_DIR / f"debug_no_share_btn_{int(time.time())}.png"))
             return False
 
-        # Scroll to share button and click
-        driver.execute_script(
-            "arguments[0].scrollIntoView({block: 'center'});", share_btn
-        )
-        human_delay(0.5, 1)
-        try:
-            share_btn.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", share_btn)
+        if not _click_robust(driver, share_btn):
+            logger.error("  Could not click Share button at all")
+            return False
         logger.info("  Clicked Share button")
         human_delay(2, 3)
 
@@ -1018,44 +1165,169 @@ def share_post(driver, post: dict) -> bool:
             )
             return False
 
-        # Click "Share now"
-        human_delay(0.5, 1)
+        # Click "Share now" / "Udostępnij w Aktualnościach". This is a
+        # SPAN nested inside a role=button div with no aria-label — so
+        # click on the span bubbles up to the parent button. Walk to
+        # the parent button explicitly to get a more reliable click.
         try:
-            share_now_btn.click()
+            parent_btn = share_now_btn.find_element(
+                By.XPATH, "ancestor::div[@role='button'][1]"
+            )
+            _click_robust(driver, parent_btn)
         except Exception:
-            # Fallback: JavaScript click
-            driver.execute_script("arguments[0].click();", share_now_btn)
+            _click_robust(driver, share_now_btn)
         logger.info("  Clicked 'Share now'")
         human_delay(3, 5)
 
-        # Step 4: Wait for share to complete
-        logger.info("  Waiting for share to complete...")
-
-        # Watch for the share menu/dialog to close
-        max_wait = 30
-        start_time = time.time()
-        while time.time() - start_time < max_wait:
+        # Step 4: Handle the "Napisz post" composer that FB now opens.
+        # Bug discovered 2026-06-30: clicking "Udostępnij w Aktualnościach"
+        # does NOT publish — it opens a composer dialog where you could
+        # add a caption above the embedded share, and at the bottom is
+        # a blue "Dalej" button. Without that final "Dalej" click, the
+        # composer stays open forever and the share never lands. Older
+        # bg_fb_share.py code just waited 30s for a toast (never came),
+        # logged "assuming share completed", and silently false-positived.
+        #
+        # Sequence we now perform:
+        #   a) wait for the 'Napisz post' / 'Create post' dialog to appear
+        #   b) click the "Dalej" / "Next" button → submits the share
+        #   c) wait for the dialog to close (success signal)
+        #   d) handle any post-publish upsell popup ("Nie teraz" etc.)
+        logger.info("  Waiting for 'Napisz post' composer to open...")
+        composer = None
+        deadline = time.time() + 12
+        while time.time() < deadline:
             try:
-                # Check if share confirmation toast appeared
-                toast_selectors = [
-                    "//*[contains(text(), 'Udost\u0119pniono')]",
-                    "//*[contains(text(), 'Shared')]",
-                    "//*[contains(text(), 'udost\u0119pniono')]",
-                ]
-                for t_sel in toast_selectors:
-                    toasts = driver.find_elements(By.XPATH, t_sel)
-                    if any(t.is_displayed() for t in toasts):
-                        logger.info("  Share confirmation toast detected!")
-                        human_delay(1, 2)
-                        break
-                else:
-                    time.sleep(1)
-                    continue
-                break
+                composer = driver.find_element(
+                    By.XPATH,
+                    "//div[@role='dialog' and (@aria-label='Napisz post' "
+                    "or @aria-label='Create post' or @aria-label='Create Post')]"
+                )
+                if composer.is_displayed():
+                    break
             except Exception:
-                time.sleep(1)
+                pass
+            time.sleep(0.5)
+
+        if composer:
+            logger.info("  Composer opened — polling for submit button (aria-label match)")
+            # FB renders the submit button as <div role='button' aria-label='Dalej'>
+            # 5 levels deep inside the dialog (verified via DOM inspection
+            # 2026-06-30). Search by aria-label directly to avoid brittle
+            # nested-span paths. Poll because FB defers button rendering
+            # by 1-3s after the dialog mount.
+            submit_clicked = False
+            submit_deadline = time.time() + 12
+            submit_xpaths = [
+                "//div[@role='dialog']//div[@role='button' and @aria-label='Dalej']",
+                "//div[@role='dialog']//div[@role='button' and @aria-label='Next']",
+                "//div[@role='dialog']//div[@role='button' and @aria-label='Opublikuj']",
+                "//div[@role='dialog']//div[@role='button' and @aria-label='Post']",
+                "//div[@role='dialog']//div[@role='button' and @aria-label='Udost\u0119pnij']",
+                "//div[@role='dialog']//div[@role='button' and @aria-label='Share']",
+            ]
+            while time.time() < submit_deadline and not submit_clicked:
+                for xp in submit_xpaths:
+                    try:
+                        elements = driver.find_elements(By.XPATH, xp)
+                        for el in elements:
+                            if not el.is_displayed():
+                                continue
+                            logger.info(f"  Found composer submit: aria-label="
+                                        f"{el.get_attribute('aria-label')!r}")
+                            if not _click_robust(driver, el):
+                                continue
+                            submit_clicked = True
+                            break
+                        if submit_clicked:
+                            break
+                    except Exception:
+                        continue
+                if not submit_clicked:
+                    time.sleep(0.5)
+
+            if not submit_clicked:
+                logger.error("  Composer open but NO submit button found within 12s — aborting")
+                try:
+                    driver.save_screenshot(
+                        str(DEBUG_DIR / f"debug_composer_stuck_{int(time.time())}.png")
+                    )
+                except Exception:
+                    pass
+                return False
+
+            # 4b: After "Dalej" the dialog title flips to "Ustawienia posta"
+            # (Post Settings). The final BLUE submit button (aria-label
+            # exactly 'Udostępnij' or 'Share', not 'Udostępnij post X')
+            # lives in a sibling DOM portal — Selenium does NOT find it
+            # via `dialog//button` scoped search. Match by exact aria-label
+            # at document scope to discriminate from page-specific share
+            # buttons that share the same word.
+            logger.info("  Waiting for Ustawienia posta dialog + blue final submit...")
+            final_clicked = False
+            final_deadline = time.time() + 15
+            while time.time() < final_deadline and not final_clicked:
+                for final_xpath in [
+                    "//div[@role='button' and @aria-label='Udost\u0119pnij']",
+                    "//div[@role='button' and @aria-label='Share']",
+                    "//div[@role='button' and @aria-label='Opublikuj']",
+                    "//div[@role='button' and @aria-label='Post']",
+                ]:
+                    try:
+                        elements = driver.find_elements(By.XPATH, final_xpath)
+                        visible = [e for e in elements if e.is_displayed()]
+                        if not visible:
+                            continue
+                        # Multiple matches possible (rare). Pick the
+                        # bottom-most (largest y) — final submit is always
+                        # at the dialog footer.
+                        visible_with_y = [(e, e.rect.get('y', 0)) for e in visible]
+                        visible_with_y.sort(key=lambda kv: kv[1], reverse=True)
+                        el = visible_with_y[0][0]
+                        logger.info(f"  Found final submit: aria-label="
+                                    f"{el.get_attribute('aria-label')!r} "
+                                    f"y={visible_with_y[0][1]:.0f}")
+                        if not _click_robust(driver, el):
+                            continue
+                        final_clicked = True
+                        break
+                    except Exception:
+                        continue
+                if not final_clicked:
+                    time.sleep(0.5)
+
+            if not final_clicked:
+                logger.error("  Final submit button never appeared — share aborted")
+                try:
+                    driver.save_screenshot(
+                        str(DEBUG_DIR / f"debug_no_final_submit_{int(time.time())}.png")
+                    )
+                except Exception:
+                    pass
+                return False
+
+            # 4c: Wait for the composer dialog to actually close as the
+            # confirmation signal. If it closes within ~25s → share landed.
+            logger.info("  Waiting for composer to close...")
+            close_deadline = time.time() + 25
+            while time.time() < close_deadline:
+                try:
+                    still_open = composer.is_displayed()
+                    if not still_open:
+                        logger.info("  ✅ Composer closed — share submitted")
+                        break
+                except Exception:
+                    # Stale ref usually means dialog DOM removed → closed
+                    logger.info("  ✅ Composer DOM gone — share submitted")
+                    break
+                time.sleep(0.5)
+            else:
+                logger.warning("  ⚠️ Composer still open after 25s — share may have failed")
         else:
-            logger.warning(f"  No confirmation toast after {max_wait}s, assuming share completed")
+            # No composer appeared — could mean FB published immediately
+            # (rare, older UI). Don't fail here — let verify_share_succeeded
+            # be the ground truth.
+            logger.info("  No composer appeared within 12s — proceeding to verify")
 
         # Step 5: Handle any popups
         popup_selectors = [
