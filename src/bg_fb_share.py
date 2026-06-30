@@ -58,7 +58,17 @@ FAILED_SHARE_RETRY_HOURS = 24
 # would try to share all of them in a single run, risking FB antispam
 # flag). At steady state most sources have 0-1 new posts per cron so
 # this cap is rarely hit; on first deploy it bounds the catch-up.
-MAX_POSTS_PER_SOURCE = 3
+#
+# Bumped 3→7 on 2026-06-30 after diagnosis: with cap=3, when Burmistrz
+# (or any prolific source) posted 2-3 things in a single day, older
+# posts from earlier that day permanently dropped below the cap and
+# were never shared. Concrete miss: Burmistrz fbid 122114608305
+# ("uczniowie klas ósmych z PSP nr 6 w gabinecie"), present as
+# posinset=7 today but never harvested because we only ever kept
+# the top 3 (posinsets 4-6). Dedupe via shared_posts.json prevents
+# the wider window from causing duplicate shares — it only widens
+# our backfill catch-up.
+MAX_POSTS_PER_SOURCE = 7
 
 # URLs that require authentication to scrape (FB blocks unauth Playwright
 # from reading them). Detected by URL pattern: profile.php?id=... maps to
