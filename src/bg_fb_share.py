@@ -110,10 +110,28 @@ MONITORED_PAGES = [
     {"name": "Stodola Dzika",                      "url": "https://www.facebook.com/StodolaDzika"},
     {"name": "Osrodek Gora Dzikowiec",             "url": "https://www.facebook.com/OSRDzikowiec"},
     # --- Religious communities ---
-    {"name": "Kosciol Uliczny Boguszow-Gorce",     "url": "https://www.facebook.com/profile.php?id=100067837419514"},
+    # REMOVED 2026-07-13 (user request): "Kościół Uliczny Boguszów-Gorce"
+    # (profile.php?id=100067837419514). The page hadn't posted anything new
+    # in months but its old 2021-2022 photos were repeatedly re-scraped
+    # after DAYS_TO_KEEP prune expired their shared_posts.json entries.
+    # Net effect: bgnews wall got a wave of years-old religious posts
+    # every ~7 days. NEVER add this profile back — user's ask is a hard
+    # no. See BLOCKED_SOURCE_URLS below (defensive guard).
     # --- TODO: WEBSITE sources (non-FB) handled by bg_scraper_selenium.py
     #     extension. Pending: https://bip.boguszow-gorce.pl/ (BIP)
 ]
+
+# Sources that must NEVER be automatically posted to bgnews wall,
+# regardless of what MONITORED_PAGES / MONITORED_GROUPS may contain.
+# Enforced by a hard guard in the scrape pipeline. User can add MONITORED
+# entries freely, but anything matching a BLOCKED_SOURCE_URLS token is
+# stripped before share.
+BLOCKED_SOURCE_URLS = {
+    # Kościół Uliczny Boguszów-Gorce — user removed 2026-07-13 after a
+    # re-share incident of years-old 2021-2022 posts.
+    "profile.php?id=100067837419514",
+    "100067837419514",
+}
 
 # FB GROUPS to monitor (require authentication — scraped via the same
 # Selenium driver that handles share, after ensure_logged_in_as_page).
@@ -133,7 +151,14 @@ MONITORED_GROUPS = [
 MIN_DELAY_BETWEEN_SHARES = 15
 MAX_DELAY_BETWEEN_SHARES = 30
 
-DAYS_TO_KEEP = 7
+# How long to remember an already-shared URL in shared_posts.json.
+# BUMPED 2026-07-13 (7 → 365) after Kościół Uliczny incident: a page with
+# no new activity had its 2021-2022 posts scraped anew, re-shared, then
+# prune-expired at day 7, then re-scraped at day 14, re-shared again.
+# One year of memory is enough to cover any quiet-page cycle we care
+# about; state file grows ~1 KB per shared URL so a year of daily shares
+# = ~10 MB, trivially manageable.
+DAYS_TO_KEEP = 365
 
 # Ensure directories exist
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -457,8 +482,18 @@ async def scrape_all_monitored_pages() -> list:
     returns 0 posts deterministically.
     """
     all_posts = []
-    unauth_sources = [s for s in MONITORED_PAGES if not _requires_auth_scrape(s['url'])]
-    auth_sources_count = len(MONITORED_PAGES) - len(unauth_sources)
+    unauth_sources = [
+        s for s in MONITORED_PAGES
+        if not _requires_auth_scrape(s['url']) and not _source_is_blocked(s['url'])
+    ]
+    auth_sources_count = sum(
+        1 for s in MONITORED_PAGES
+        if _requires_auth_scrape(s['url']) and not _source_is_blocked(s['url'])
+    )
+    blocked_count = sum(1 for s in MONITORED_PAGES if _source_is_blocked(s['url']))
+    if blocked_count:
+        logger.info(f"🚫 {blocked_count} source(s) silently blocked by "
+                    f"BLOCKED_SOURCE_URLS guard")
 
     for page_config in unauth_sources:
         posts = await scrape_fb_page(page_config['url'], page_config['name'])
@@ -533,11 +568,36 @@ def scrape_fb_page_with_selenium(driver, page_url: str, page_name: str) -> list:
         return []
 
 
+def _source_is_blocked(source_url: str) -> bool:
+    """Hard-block a source regardless of what MONITORED_PAGES contains.
+    Enforces user-declared do-not-share list (Kościół Uliczny etc.).
+    Called defensively before every scrape + before every share."""
+    if not source_url:
+        return False
+    for token in BLOCKED_SOURCE_URLS:
+        if token and token in source_url:
+            return True
+    return False
+
+
 def scrape_all_auth_pages(driver) -> list:
     """Scrape all MONITORED_PAGES entries flagged as auth-required
     (profile.php?id=...) using the given Selenium driver. Sequential,
-    with small human_delay between sources."""
-    auth_sources = [s for s in MONITORED_PAGES if _requires_auth_scrape(s['url'])]
+    with small human_delay between sources.
+
+    BLOCKED_SOURCE_URLS entries are silently skipped even if they slip
+    into MONITORED_PAGES (defense in depth against future config edits)."""
+    auth_sources = [
+        s for s in MONITORED_PAGES
+        if _requires_auth_scrape(s['url']) and not _source_is_blocked(s['url'])
+    ]
+    blocked_count = sum(
+        1 for s in MONITORED_PAGES
+        if _requires_auth_scrape(s['url']) and _source_is_blocked(s['url'])
+    )
+    if blocked_count:
+        logger.info(f"🚫 {blocked_count} auth source(s) silently blocked "
+                    f"by BLOCKED_SOURCE_URLS guard")
     if not auth_sources:
         return []
     logger.info(f"--- Phase 2b: Auth scrape of {len(auth_sources)} profile.php source(s) ---")
