@@ -187,18 +187,39 @@ OVERLAY_IMAGE_IN_SEASON = MAPS_DIR / "1_5_percentMapOverlayImageTranspartenBCKG.
 OVERLAY_IMAGE_OFF_SEASON = MAPS_DIR / "MapOverlayImage.png"
 
 
+def _is_in_charity_season():
+    """True during the Polish PIT filing window (Mar 1 – Jun 1 inclusive),
+    when the 1.5% tax deduction is claimable. False the rest of the year."""
+    from datetime import date as _date
+    today = _date.today()
+    m, d = today.month, today.day
+    return m in (3, 4, 5) or (m == 6 and d == 1)
+
+
 def _get_active_overlay_path():
-    """Pick the charity overlay to render TODAY based on the calendar.
+    """Pick the charity overlay image to render TODAY based on the calendar.
 
     In-season = Mar 1 to Jun 1 (inclusive on both ends) — the Polish PIT
     filing window during which the 1.5% tax deduction is claimable.
     Off-season = every other day of the year.
     """
-    from datetime import date as _date
-    today = _date.today()
-    m, d = today.month, today.day
-    in_season = m in (3, 4, 5) or (m == 6 and d == 1)
-    return OVERLAY_IMAGE_IN_SEASON if in_season else OVERLAY_IMAGE_OFF_SEASON
+    return OVERLAY_IMAGE_IN_SEASON if _is_in_charity_season() else OVERLAY_IMAGE_OFF_SEASON
+
+
+def _get_charity_caption_line():
+    """The 2nd charity caption line — season-aware.
+
+    In-season (Mar 1 – Jun 1): "👉 To nic Cię nie kosztuje. KRS: 0000498479"
+    Off-season (rest of year): "👉 NR KONTA : 58 … "Na cele statutowe""
+
+    Off-season variant switches from 1.5%-tax pitch (which is only
+    claimable during PIT filing window) to a plain donation ask with
+    the foundation's bank account. Introduced 2026-07-16 together with
+    the season-aware overlay image swap.
+    """
+    if _is_in_charity_season():
+        return "👉 To nic Cię nie kosztuje. KRS: 0000498479"
+    return "👉 NR KONTA : 58 1240 1952 1111 0010 6647 5854 \u201cNa cele statutowe\u201d"
 
 
 OVERLAY_POSITION = (900, 1090)  # Bottom-right area, moved 30px up
@@ -3381,7 +3402,7 @@ def publish_rcb_alert_only(warnings: list) -> bool:
 {forecast_text}
 
 ❤️ Mieszkańcu Boguszowa-Gorc — możesz wesprzeć lokalną fundację.
-👉 To nic Cię nie kosztuje. KRS: 0000498479
+{_get_charity_caption_line()}
 
 Więcej: {FB_PROFILE_LINK}
 
@@ -3569,7 +3590,7 @@ def main():
 {forecast_text}
 
 ❤️ Mieszkańcu Boguszowa-Gorc — możesz wesprzeć lokalną fundację.
-👉 To nic Cię nie kosztuje. KRS: 0000498479
+{_get_charity_caption_line()}
 
 Więcej: {FB_PROFILE_LINK}
 
