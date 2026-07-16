@@ -166,9 +166,41 @@ WARNING_EVENT_EMOJI = {
 # ============================================
 # CHARITY OVERLAY CONFIGURATION
 # ============================================
-# Overlay image (1.5% tax donation advertisement)
+# Charity overlay images (Ulica Swoje Wie fundacja).
+#
+# Two variants — same graphic style, same file size, so switching is a
+# clean drop-in with no OVERLAY_POSITION change needed:
+#
+#   IN-SEASON (Mar 1 – Jun 1, PIT filing period):
+#     1_5_percentMapOverlayImageTranspartenBCKG.png
+#     "Przekaż 1,5% podatku, KRS: 0000498479"
+#
+#   OFF-SEASON (rest of year):
+#     MapOverlayImage.png
+#     "Przekaż darowiznę, NR KONTA: 58 1240 1952 1111 0010 6647 5854"
+#
+# Introduced 2026-07-16. The 1.5% tax deduction is only claimable during
+# the annual PIT submission window; outside that window we ask for direct
+# donations to the foundation's bank account instead.
 OVERLAY_ENABLED = True
-OVERLAY_IMAGE = MAPS_DIR / "1_5_percentMapOverlayImageTranspartenBCKG.png"
+OVERLAY_IMAGE_IN_SEASON = MAPS_DIR / "1_5_percentMapOverlayImageTranspartenBCKG.png"
+OVERLAY_IMAGE_OFF_SEASON = MAPS_DIR / "MapOverlayImage.png"
+
+
+def _get_active_overlay_path():
+    """Pick the charity overlay to render TODAY based on the calendar.
+
+    In-season = Mar 1 to Jun 1 (inclusive on both ends) — the Polish PIT
+    filing window during which the 1.5% tax deduction is claimable.
+    Off-season = every other day of the year.
+    """
+    from datetime import date as _date
+    today = _date.today()
+    m, d = today.month, today.day
+    in_season = m in (3, 4, 5) or (m == 6 and d == 1)
+    return OVERLAY_IMAGE_IN_SEASON if in_season else OVERLAY_IMAGE_OFF_SEASON
+
+
 OVERLAY_POSITION = (900, 1090)  # Bottom-right area, moved 30px up
 OVERLAY_SHADOW_ENABLED = True
 OVERLAY_SHADOW_OFFSET = 10  # Same as weather icon shadow
@@ -1140,16 +1172,21 @@ def add_charity_overlay(img):
     """
     Add charity overlay image to the weather map.
     Applies drop shadow if enabled.
+
+    The active overlay is picked dynamically per-day by
+    _get_active_overlay_path() — 1.5%-tax variant during PIT filing
+    period (Mar 1 – Jun 1), donation variant the rest of the year.
     """
     if not OVERLAY_ENABLED:
         return img
 
-    if not OVERLAY_IMAGE.exists():
-        logger.warning(f"⚠️ Overlay image not found: {OVERLAY_IMAGE}")
+    overlay_path = _get_active_overlay_path()
+    if not overlay_path.exists():
+        logger.warning(f"⚠️ Overlay image not found: {overlay_path}")
         return img
 
     try:
-        overlay = Image.open(OVERLAY_IMAGE).convert('RGBA')
+        overlay = Image.open(overlay_path).convert('RGBA')
         x, y = OVERLAY_POSITION
 
         if OVERLAY_SHADOW_ENABLED and OVERLAY_SHADOW_OFFSET > 0:
