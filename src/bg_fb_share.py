@@ -97,9 +97,17 @@ MONITORED_PAGES = [
     {"name": "Gmina Miasto Boguszow-Gorce",       "url": "https://www.facebook.com/gminamiastoboguszowgorce"},
     {"name": "Burmistrz Daniel Lubinski",         "url": "https://www.facebook.com/profile.php?id=61583693225846"},
     {"name": "Straz Miejska Boguszow-Gorce",      "url": "https://www.facebook.com/profile.php?id=100065918171599"},
-    {"name": "OSP Boguszow",                       "url": "https://www.facebook.com/ospboguszow"},
+    # match_tokens: FB calls this page 'Ochotnicza Straż Pożarna Boguszów', so
+    # neither 'OSP' nor a bare 'Boguszow' identifies it — the latter is shared
+    # with five other sources.
+    {"name": "OSP Boguszow",                       "url": "https://www.facebook.com/ospboguszow",
+     "match_tokens": ["ochotnicza", "pozarna"]},
     # --- Culture / education ---
-    {"name": "MBPCK (biblioteka + centrum kultury)", "url": "https://www.facebook.com/MBPCK"},
+    # match_tokens: FB calls this page 'Miejska Biblioteka Publiczna - Centrum
+    # Kultury...'. 'MBPCK' is an initialism that appears nowhere in the label,
+    # which is why every MBPCK run used to fall through to the topmost guess.
+    {"name": "MBPCK (biblioteka + centrum kultury)", "url": "https://www.facebook.com/MBPCK",
+     "match_tokens": ["biblioteka", "kultury"]},
     {"name": "Zespol Szkolno-Przedszkolny",       "url": "https://www.facebook.com/profile.php?id=100063549236963"},
     # --- Sport / recreation ---
     {"name": "OSiR Boguszow-Gorce",                "url": "https://www.facebook.com/osirbg"},
@@ -863,6 +871,76 @@ def _strip_pl(s: str) -> str:
     return (s or '').translate(_PL_DIACRITIC_MAP)
 
 
+def _norm_label(s: str) -> str:
+    """Diacritics stripped, lower-cased, punctuation flattened to spaces.
+
+    _strip_pl() alone was not enough and the gap was invisible until it was
+    traced: it removes diacritics but preserves case and punctuation. So the
+    source 'MBPCK (biblioteka + centrum kultury)' produced the tokens
+    'MBPCK', '(biblioteka', 'centrum', 'kultury' — against FB's actual label
+    'Miejska Biblioteka Publiczna - Centrum Kultury...'. 'MBPCK' is an
+    initialism that never appears, the bracket corrupted one token, and
+    'centrum' != 'Centrum'. Every MBPCK run therefore fell through to the
+    topmost-button guess. Normalising both sides fixes all three at once.
+    """
+    s = _strip_pl(s or '').lower()
+    return ' '.join(''.join(c if c.isalnum() else ' ' for c in s).split())
+
+
+def _tokens(s: str) -> list:
+    # >=3, not >=4. At >=4 the source 'OSP Boguszow' lost 'osp' entirely and
+    # was left with nothing but the ambiguous 'boguszow', which it shares with
+    # OSiR, Gornik, HEROS, Straz Miejska and Gmina Miasto — so OSP would match
+    # whichever of those rendered first. Safe to lower only because matching is
+    # now word-boundary rather than substring ('osp' as a substring would hit
+    # 'gospodarstwo').
+    return [w for w in _norm_label(s).split() if len(w) >= 3]
+
+
+# Tokens that do NOT identify one source, because they appear in our own page
+# name or in more than one monitored source. 'boguszow' and 'gorce' are in
+# five source names AND in ours, which is precisely how the bot ended up
+# clicking Share on its own posts. Computed from config rather than hard-coded
+# so that adding a source keeps this honest.
+def _ambiguous_tokens() -> set:
+    from collections import Counter
+    counts = Counter()
+    for src in MONITORED_PAGES:
+        for tok in set(_tokens(src.get('name', ''))):
+            counts[tok] += 1
+    ours = set(_tokens(FB_PAGE_NAME))
+    return {t for t, n in counts.items() if n > 1} | ours
+
+
+_AMBIGUOUS_TOKENS = None
+
+
+def _source_match_tokens(source_name: str) -> list:
+    """Distinctive tokens first, ambiguous ones last (never dropped — for a
+    source like 'OSiR Boguszow-Gorce' the ambiguous token may be all we have,
+    and by then our own page's buttons are already excluded anyway).
+
+    An entry may override this with an explicit 'match_tokens', which is what
+    you want whenever our MONITORED_PAGES label is not what Facebook actually
+    calls the page — an initialism like MBPCK, or a shorthand like 'OSP
+    Boguszow' for 'Ochotnicza Straż Pożarna Boguszów'."""
+    global _AMBIGUOUS_TOKENS
+    if _AMBIGUOUS_TOKENS is None:
+        _AMBIGUOUS_TOKENS = _ambiguous_tokens()
+
+    for src in MONITORED_PAGES:
+        if src.get('name') == source_name and src.get('match_tokens'):
+            return [_norm_label(t) for t in src['match_tokens']]
+
+    toks = []
+    for t in _tokens(source_name):
+        if t not in toks:
+            toks.append(t)
+    distinctive = [t for t in toks if t not in _AMBIGUOUS_TOKENS]
+    ambiguous = [t for t in toks if t in _AMBIGUOUS_TOKENS]
+    return distinctive + ambiguous
+
+
 def _click_robust(driver, el):
     """Click an element, falling back to JS click if the native click
     is intercepted (e.g. FB renders an <img> on top of the share button
@@ -915,13 +993,14 @@ def _find_share_button_for_post(driver, post: dict, max_wait_s: int = 15):
     span fallback frequently selected the wrong post's button.
     """
     source_name = post.get('source_name', '') or ''
-    source_stripped = _strip_pl(source_name)
-    # Most distinctive tokens for our MONITORED_PAGES (first-word usually
-    # works: 'Gmina', 'Burmistrz', 'Straz', 'OSP', 'MBPCK', 'Zespol',
-    # 'OSiR', 'Gornik', 'HEROS', 'Stajnia', 'Stodola', 'Osrodek', 'Kosciol'.
-    # 'Boguszow-Gorce' appears in many so we use the FIRST distinctive
-    # word as the precise needle, falling back to full name match.)
-    distinctive_tokens = [w for w in source_stripped.split() if len(w) >= 4]
+    source_norm = _norm_label(source_name)
+    # The old code built this list with a bare split() and then iterated
+    # buttons OUTER / tokens INNER, so the winner was the first button in DOM
+    # order matching ANY token — not the best-matching button. Now every button
+    # is scored (step 1) and order here is only cosmetic.
+    match_tokens = _source_match_tokens(source_name)
+    our_page_norm = _norm_label(FB_PAGE_NAME)
+    unmatched_logged = False
 
     deadline = time.time() + max_wait_s
     while time.time() < deadline:
@@ -937,38 +1016,106 @@ def _find_share_button_for_post(driver, post: dict, max_wait_s: int = 15):
             candidates = []
 
         visible_buttons = []
+        skipped_own = 0
         for c in candidates:
             try:
                 if not c.is_displayed():
                     continue
                 label = c.get_attribute('aria-label') or ''
-                visible_buttons.append((c, label, _strip_pl(label), c.rect.get('y', 0)))
+                norm = _norm_label(label)
+                # THE ROOT CAUSE OF THE DUPLICATES (2026-08-06, 110 occurrences
+                # in the logs since 03.08, several a day at :36 past the hour).
+                #
+                # A permalink page renders our OWN page's posts alongside the
+                # target post, each with its own Share button. Nothing excluded
+                # them, and the token 'boguszow-gorce' is in five source names
+                # AND in ours — so 'Udostępnij post Boguszów-Gorce Newsy i
+                # Informacje' matched as "precise" and the bot re-shared its own
+                # post. Traced end to end at 15:35-15:36 today: the 15:35 share
+                # of an OSP post created a post on our wall, and one minute
+                # later, while looking for an MBPCK post, the bot clicked Share
+                # under that very post — producing the two identical OSP entries
+                # the user saw. Verification then looked for the MBPCK needle,
+                # correctly failed, and recorded a failure, so the duplicate was
+                # never even written to shared_posts.json.
+                #
+                # We can never legitimately want to re-share our own post here,
+                # so this exclusion is unconditional and applies to every step
+                # below, not just the precise one.
+                if our_page_norm and our_page_norm in norm:
+                    skipped_own += 1
+                    continue
+                visible_buttons.append((c, label, norm, c.rect.get('y', 0)))
             except Exception:
                 continue
 
-        # (1) precise — token match on stripped aria-label
-        for el, label, stripped, y in visible_buttons:
-            for tok in distinctive_tokens:
-                if tok in stripped:
-                    logger.info(f"  Found Share button (precise '{tok}'): {label!r}")
-                    return el
+        if skipped_own:
+            logger.info(f"  Ignored {skipped_own} Share button(s) belonging to our own page")
 
-        # (2) fallback — full source name as substring (stripped both sides)
-        if source_stripped:
-            for el, label, stripped, y in visible_buttons:
-                if source_stripped in stripped:
+        # (1) precise — SCORE every button, take the clear winner.
+        #
+        # First-token-wins was not good enough, and a test against the real FB
+        # labels showed why: source 'Straz Miejska Boguszow-Gorce' matched
+        # 'Udostępnij post Ochotnicza Straż Pożarna Boguszów' on the token
+        # 'straz', because that word is in both pages' names. Counting matches
+        # instead makes the true owner win on total evidence — Straż Miejska's
+        # own button matches straz+miejska+boguszow+gorce, OSP's only straz+
+        # boguszow. Distinctive tokens are worth double so an accidental
+        # overlap on a shared word cannot outvote a real name match.
+        #
+        # Word-boundary, not substring: 'osp' must not match 'gospodarstwo'.
+        scored = []
+        for el, label, norm, y in visible_buttons:
+            words = set(norm.split())
+            hits = [t for t in match_tokens if t in words]
+            score = sum(1 if t in _AMBIGUOUS_TOKENS else 2 for t in hits)
+            if score:
+                scored.append((score, hits, el, label))
+
+        if scored:
+            best = max(s for s, _, _, _ in scored)
+            winners = [x for x in scored if x[0] == best]
+            if len(winners) == 1:
+                score, hits, el, label = winners[0]
+                logger.info(f"  Found Share button (score={score}, matched {hits}): {label!r}")
+                return el
+            # A tie means two pages' buttons look equally like our source. That
+            # is exactly the situation where the old code silently picked one.
+            logger.warning(
+                f"  Ambiguous: {len(winners)} share buttons tie at score {best} for "
+                f"'{source_name}': {[w[3] for w in winners]} — will not guess"
+            )
+
+        # (2) fallback — full source name as substring
+        if source_norm:
+            for el, label, norm, y in visible_buttons:
+                if source_norm in norm:
                     logger.info(f"  Found Share button (fullname): {label!r}")
                     return el
 
-        # (3) topmost — last resort, log a warning so we notice
+        # (3) NO topmost guess. It used to return the topmost button here with
+        # a warning, which fired 62 times and is how MBPCK — whose tokens could
+        # never match its FB label — kept clicking whatever happened to be on
+        # top. A wrong share is worse than no share: the caller records a
+        # failure and retries after 24h, which costs nothing, while a wrong
+        # share puts a duplicate on the wall that nobody removes.
+        #
+        # Note we do NOT return here. Proper buttons being present but
+        # unmatched can simply mean the target post has not rendered yet, so we
+        # keep polling until max_wait_s and only then give up (falling out of
+        # the loop to `return None`). We also skip the Reel/legacy steps in
+        # that case: those pick the topmost of a generic-labelled set, which is
+        # the very guess we just refused to make.
         if visible_buttons:
-            visible_buttons.sort(key=lambda t: t[3])
-            el, label, stripped, y = visible_buttons[0]
-            logger.warning(
-                f"  ⚠️ Source name '{source_name}' not found in any share-button aria-label; "
-                f"falling back to topmost (y={y:.0f}): {label!r} — risk of sharing wrong post"
-            )
-            return el
+            if not unmatched_logged:
+                labels = [lbl for _, lbl, _, _ in visible_buttons][:5]
+                logger.warning(
+                    f"  Source '{source_name}' matched none of {match_tokens} yet; "
+                    f"buttons seen: {labels} — retrying until {max_wait_s}s elapse"
+                )
+                unmatched_logged = True
+            time.sleep(0.5)
+            continue
 
         # (4) Reel / simpler aria-label
         try:
