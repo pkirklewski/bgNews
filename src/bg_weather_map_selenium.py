@@ -222,6 +222,20 @@ def _get_charity_caption_line():
     return "👉 NR KONTA : 58 1240 1952 1111 0010 6647 5854 \u201cNa cele statutowe\u201d"
 
 
+# Third and last line of the charity block. Added 2026-08-04 at the operator's
+# request, in place of "Więcej: {FB_PROFILE_LINK}", so the ask ends where the
+# reader can act on it instead of pointing back at the page they are already
+# looking at. Applied across the whole fleet on the same day.
+#
+# WATCH THE ACCEPTANCE RATE. This is the first EXTERNAL link a map caption has
+# ever carried — until now the only URL in it was fb.com/…, which Facebook
+# treats as internal. Plenty of Polish local groups auto-hold or reject posts
+# containing outside links, and every acceptance figure recorded so far was
+# measured without one. If group_audit.py shows a drop over the next couple of
+# weeks, this line is the first suspect and reverting it is a one-line change.
+CHARITY_MORE_URL = "https://ulicaswojewie.org.pl/aktualnosci/"
+
+
 OVERLAY_POSITION = (900, 1090)  # Bottom-right area, moved 30px up
 OVERLAY_SHADOW_ENABLED = True
 OVERLAY_SHADOW_OFFSET = 10  # Same as weather icon shadow
@@ -3192,6 +3206,31 @@ def _mark_alerts_posted(warnings: list) -> None:
 # overlay, until dedicated event-type icons exist.
 RCB_STORM_THEMED_EVENTS = {"Burze", "Burze z gradem", "Trąby powietrzne"}
 
+# 2026-08-21: the set above was matched with `primary_event in
+# RCB_STORM_THEMED_EVENTS` — EXACT equality — and IMGW's vocabulary does not
+# cooperate. Of the only two event names this fleet has ever actually received,
+# "Burze" and "Silny deszcz z burzami", just the first one matched. The second
+# took the else-branch below, which here is worse than on the other projects:
+# it selects map_sun.png / map_moon.png, so a stopień-2 thunderstorm warning
+# would have gone out over a SUNNY map. Caught on wchNews 2026-08-21 07:05;
+# every project carried the same defect.
+#
+# Match on the stem instead: any IMGW event mentioning a storm ("burz…") or a
+# tornado ("trąb…") is storm-themed, however the rest of the name reads. Heat
+# events are deliberately NOT caught here — a storm cloud over an Upał alert is
+# wrong (operator feedback 2026-06-26).
+_STORM_STEMS = ("burz", "trab")
+
+
+def _is_storm_event(event: str) -> bool:
+    """True for any IMGW event name that mentions storms or tornadoes."""
+    if event in RCB_STORM_THEMED_EVENTS:
+        return True
+    norm = (event or '').lower()
+    for src, dst in zip('ąćęłńóśźż', 'acelnoszz'):
+        norm = norm.replace(src, dst)
+    return any(stem in norm for stem in _STORM_STEMS)
+
 
 def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
     """Build the bg alert map image from scratch.
@@ -3209,7 +3248,7 @@ def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     primary_event = (warnings[0].get('nazwa_zdarzenia', '') if warnings else '')
-    use_storm_visual = primary_event in RCB_STORM_THEMED_EVENTS
+    use_storm_visual = _is_storm_event(primary_event)
     is_night = get_forecast_mode() == 'night'
 
     if use_storm_visual:
@@ -3403,8 +3442,7 @@ def publish_rcb_alert_only(warnings: list) -> bool:
 
 ❤️ Mieszkańcu Boguszowa-Gorc — możesz wesprzeć lokalną fundację.
 {_get_charity_caption_line()}
-
-Więcej: {FB_PROFILE_LINK}
+Więcej: {CHARITY_MORE_URL}
 
 #BoguszówGorce #Boguszów #DolnyŚląsk"""
 
@@ -3591,8 +3629,7 @@ def main():
 
 ❤️ Mieszkańcu Boguszowa-Gorc — możesz wesprzeć lokalną fundację.
 {_get_charity_caption_line()}
-
-Więcej: {FB_PROFILE_LINK}
+Więcej: {CHARITY_MORE_URL}
 
 #BoguszówGorce #Boguszów #DolnyŚląsk"""
 
