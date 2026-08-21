@@ -3226,10 +3226,78 @@ def _is_storm_event(event: str) -> bool:
     """True for any IMGW event name that mentions storms or tornadoes."""
     if event in RCB_STORM_THEMED_EVENTS:
         return True
+    return any(stem in _norm_event(event) for stem in _STORM_STEMS)
+
+
+def _norm_event(event: str) -> str:
+    """Lower-case an IMGW event name and strip Polish diacritics."""
     norm = (event or '').lower()
     for src, dst in zip('ąćęłńóśźż', 'acelnoszz'):
         norm = norm.replace(src, dst)
-    return any(stem in norm for stem in _STORM_STEMS)
+    return norm
+
+
+def _is_heat_event(event: str) -> bool:
+    """True for any IMGW heat event ("Upał", "Silny upał", "Upał ekstremalny"…)."""
+    return "upal" in _norm_event(event)
+
+
+# Event type → alert base map. Ordered; FIRST match wins, so a compound name
+# resolves to its most severe component ("Silny deszcz z burzami" is a storm,
+# not rain; "Opady marznące" is freezing rain, not rain).
+#
+# 2026-08-21, second half of the storm fix, and this project needed it most.
+# The else-branch below picked map_sun.png / map_moon.png purely from the time
+# of day, with no reference to the warning at all — so every non-storm IMGW
+# alert here published over a SUNNY map. `Intensywne opady deszczu` was active
+# over Poland while this was written and would have done exactly that.
+#
+# There is no wind artwork, so wind lands on map_cloud.png — a compromise, not
+# a match, but a neutral overcast map under a wind warning is defensible where
+# a sunny one is not. Same for the final fallback: an unanticipated event name
+# gets clouds, never sun.
+_ALERT_MAP_RULES = (
+    (("marzn", "oblodz", "golole"),  "map_rain_snow.png",  None),
+    (("snie", "zawiej", "zamiec"),   "map_snow.png",       None),
+    (("mroz",),                      "map_snow_light.png", None),
+    (("deszcz", "roztop", "powodz", "wezbran"),
+                                     "map_rain.png",       None),
+    (("mgl", "mgiel", "szadz"),      "map_fog.png",        "map_fog_moon.png"),
+    (("wiatr", "wichur", "huragan"), "map_cloud.png",      None),
+)
+
+
+def _resolve_map_asset(filename: str, storm: bool) -> str:
+    """Guarantee the chosen alert map actually exists on disk.
+
+    Kept here rather than at the call sites so the event→map table can never
+    hand a caller a filename this project does not ship. wroNews has never
+    had map_stormRCB2.png, and before this the substitution lived in
+    generate_map_image() as a storm-only special case — which would have put
+    a STORM map under a fog or wind warning had any other asset gone missing.
+    """
+    if (MAPS_DIR / filename).exists():
+        return filename
+    alt = "map_storm.png" if storm else "map_cloud.png"
+    if not (MAPS_DIR / alt).exists():
+        alt = "map_cloud.png"
+    logger.warning(f"Alert map asset {filename} missing - using {alt}")
+    return alt
+
+
+def _alert_map_for_event(event: str, is_night: bool = False) -> str:
+    """Pick an alert's base map from the EVENT NAME, never from the clock."""
+    if _is_storm_event(event):
+        return _resolve_map_asset(RCB_ALERT_STORM_BASE, True)
+    if _is_heat_event(event):
+        # Heat keeps the sun/moon deliberately — a storm cloud over an Upał
+        # alert is wrong (operator feedback 2026-06-26).
+        return _resolve_map_asset("map_moon.png" if is_night else "map_sun.png", False)
+    norm = _norm_event(event)
+    for stems, day_map, night_map in _ALERT_MAP_RULES:
+        if any(s in norm for s in stems):
+            return _resolve_map_asset(night_map if (is_night and night_map) else day_map, False)
+    return _resolve_map_asset("map_cloud.png", False)
 
 
 def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
@@ -3251,12 +3319,12 @@ def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
     use_storm_visual = _is_storm_event(primary_event)
     is_night = get_forecast_mode() == 'night'
 
+    base_filename = _alert_map_for_event(primary_event, is_night)
     if use_storm_visual:
-        base_filename = RCB_ALERT_STORM_BASE  # map_storm.png
         logger.info(f"🚨 RCB ALERT MAP (Burze-themed): {base_filename} + storm overlay")
     else:
-        base_filename = "map_moon.png" if is_night else "map_sun.png"
-        logger.info(f"🚨 RCB ALERT MAP ({primary_event!r}): {base_filename} (no overlay)")
+        logger.info(f"🚨 RCB ALERT MAP ({primary_event!r}): event-matched "
+                    f"{base_filename} (no overlay)")
 
     base_path = MAPS_DIR / base_filename
     if not base_path.exists():
