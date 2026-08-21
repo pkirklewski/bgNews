@@ -127,17 +127,18 @@ IMGW_TERYT_CODES = ["0221"]
 IMGW_WARNINGS_URL = "https://danepubliczne.imgw.pl/api/data/warningsmeteo/teryt/{teryt}"
 
 # RCB alert visual config (mirror of wch). The alert image is composed as:
-#   map_storm.png (base) + stormRCB2transpartentBCKG.png (overlay at
-#   position below) + scarlet temps + banerTopRCB.png (broadcast banner
-#   on top) + dynamic warning cards + drop shadow under banner block.
+#   event-matched base map + event-matched rcb_*.png icon with its degree
+#   badge (apply_rcb_icon) + scarlet temps + banerTopRCB.png (broadcast
+#   banner on top) + dynamic warning cards + drop shadow under banner block.
+#
+# RCB_ALERT_STORM_OVERLAY / RCB_OVERLAY_W / _X / _Y lived here until
+# 2026-08-21. They pasted one fixed thundercloud, with a "2" painted into the
+# artwork, and only on storm alerts. Their geometry was not lost: it is
+# RCB_ICON_FRAME_W / RCB_ICON_ANCHOR next to apply_rcb_icon, which reproduces
+# the (680, -90) placement those constants shipped for months.
 RCB_ALERT_TEMP_COLOR = (255, 36, 0)            # Scarlet #FF2400
 RCB_ALERT_BANNER_FILE = "banerTopRCB.png"      # broadcast-style alert banner
 RCB_ALERT_STORM_BASE = "map_storm.png"         # base map (with city outline)
-RCB_ALERT_STORM_OVERLAY = "stormRCB2transpartentBCKG.png"  # dramatic storm cloud
-# Overlay positioning iterated with user 2026-06-20 (v5 was final):
-RCB_OVERLAY_W = 640
-RCB_OVERLAY_X = 680
-RCB_OVERLAY_Y = -90  # slight negative — overlay extends above map top
 RCB_CARD_BG = (255, 248, 232)                   # cream cards background
 RCB_CARD_INK = (24, 24, 24)
 RCB_CARD_INK_SOFT = (60, 60, 60)
@@ -3300,6 +3301,87 @@ def _alert_map_for_event(event: str, is_night: bool = False) -> str:
     return _resolve_map_asset("map_cloud.png", False)
 
 
+# ---------------------------------------------------------------------------
+# RCB alert icon, composed at run time (2026-08-21)
+#
+# This project already composed its alert map, but with one fixed overlay —
+# stormRCB2transpartentBCKG.png, a thundercloud with a "2" painted into the
+# artwork. So a stopień-1 or stopień-3 warning still went out showing a "2",
+# and because storm was the only icon that existed, every non-storm alert
+# (mróz, mgła, wiatr, oblodzenie) got NO icon at all.
+#
+# Now the icon is assembled: an event-matched rcb_*.png plus a separate degree
+# badge. Every rcb_*.png shares one content frame, so they all land in the same
+# place. RCB_ICON_FRAME_W / RCB_ICON_ANCHOR below are the old RCB_OVERLAY_W /
+# _X / _Y expressed in that frame's terms: they reproduce the shipped
+# (680, -90) placement exactly, which is how the other cities' numbers were
+# derived from this project's.
+RCB_ICON_FRAME = (176, 177, 1069, 927)   # content box inside every rcb_*.png
+RCB_ICON_BADGE_AT = (892, 695)           # degree badge centre in that canvas
+RCB_ICON_FRAME_W = 456                   # frame width on this city's map
+RCB_ICON_ANCHOR = (1226, 0)              # where the frame's top-right lands
+
+_RCB_ICON_RULES = (
+    (("burz", "trab", "grad"),                          "storm"),
+    (("upal",),                                         "heat"),
+    (("marzn", "oblodz", "golole"),                     "rain_snow"),
+    (("snie", "zawiej", "zamiec"),                      "snow"),
+    (("mroz",),                                         "frost"),
+    (("deszcz", "roztop", "powodz", "wezbran", "opad"), "rain"),
+    (("mgl", "mgiel", "szadz"),                         "fog"),
+    (("wiatr", "wichur", "huragan"),                    "wind"),
+)
+
+
+def _rcb_icon_for_event(event: str) -> str:
+    """Pick the alert icon from the event name, mirroring _ALERT_MAP_RULES."""
+    norm = _norm_event(event)
+    for stems, kind in _RCB_ICON_RULES:
+        if any(s in norm for s in stems):
+            return kind
+    return "wind"        # unrecognised: a plain cloud, never a sunny sky
+
+
+def _rcb_icon_scale_dest() -> tuple:
+    x0, y0, x1, _ = RCB_ICON_FRAME
+    scale = RCB_ICON_FRAME_W / (x1 - x0)
+    return scale, (round(RCB_ICON_ANCHOR[0] - x1 * scale),
+                   round(RCB_ICON_ANCHOR[1] - y0 * scale))
+
+
+def apply_rcb_icon(img, event: str, stopien=None):
+    """Paste the event's RCB icon, with its degree badge, onto the map."""
+    kind = _rcb_icon_for_event(event)
+    icon_path = MAPS_DIR / f"rcb_{kind}.png"
+    if not icon_path.exists():
+        logger.warning(f"⚠️ RCB icon {icon_path.name} missing — map left as-is")
+        return img
+    icon = Image.open(icon_path).convert("RGBA")
+
+    try:
+        degree = min(3, max(1, int(str(stopien).strip())))
+    except (TypeError, ValueError):
+        logger.warning(f"⚠️ Unreadable stopień {stopien!r} — badge falls back to 2")
+        degree = 2
+    badge_path = MAPS_DIR / f"rcb_badge_{degree}.png"
+    if badge_path.exists():
+        badge = Image.open(badge_path).convert("RGBA")
+        icon.alpha_composite(badge,
+                             (RCB_ICON_BADGE_AT[0] - badge.width // 2,
+                              RCB_ICON_BADGE_AT[1] - badge.height // 2))
+    else:
+        logger.warning(f"⚠️ RCB badge {badge_path.name} missing — icon has no degree")
+
+    scale, dest = _rcb_icon_scale_dest()
+    icon = icon.resize((max(1, round(icon.width * scale)),
+                        max(1, round(icon.height * scale))), Image.LANCZOS)
+    out = img.convert("RGBA")
+    out.alpha_composite(icon, dest)
+    logger.info(f"🚨 RCB icon rcb_{kind}.png stopień {degree} → {dest} "
+                f"(scale {scale:.3f})")
+    return out
+
+
 def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
     """Build the bg alert map image from scratch.
 
@@ -3316,15 +3398,11 @@ def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     primary_event = (warnings[0].get('nazwa_zdarzenia', '') if warnings else '')
-    use_storm_visual = _is_storm_event(primary_event)
     is_night = get_forecast_mode() == 'night'
 
     base_filename = _alert_map_for_event(primary_event, is_night)
-    if use_storm_visual:
-        logger.info(f"🚨 RCB ALERT MAP (Burze-themed): {base_filename} + storm overlay")
-    else:
-        logger.info(f"🚨 RCB ALERT MAP ({primary_event!r}): event-matched "
-                    f"{base_filename} (no overlay)")
+    logger.info(f"🚨 RCB ALERT MAP ({primary_event!r}): event-matched "
+                f"{base_filename} + rcb_{_rcb_icon_for_event(primary_event)}.png")
 
     base_path = MAPS_DIR / base_filename
     if not base_path.exists():
@@ -3333,18 +3411,12 @@ def _compose_bg_alert_map(districts_data: list, warnings: list) -> tuple:
 
     base = Image.open(base_path).convert('RGBA')
 
-    # Storm overlay ONLY for storm-themed events
-    if use_storm_visual:
-        overlay_path = MAPS_DIR / RCB_ALERT_STORM_OVERLAY
-        if overlay_path.exists():
-            overlay = Image.open(overlay_path).convert('RGBA')
-            oh = int(overlay.size[1] * (RCB_OVERLAY_W / overlay.size[0]))
-            overlay = overlay.resize((RCB_OVERLAY_W, oh), Image.LANCZOS)
-            base.alpha_composite(overlay, dest=(RCB_OVERLAY_X, RCB_OVERLAY_Y))
-            logger.info(f"✅ Storm overlay {RCB_OVERLAY_W}×{oh} composited at "
-                        f"({RCB_OVERLAY_X}, {RCB_OVERLAY_Y})")
-        else:
-            logger.warning(f"⚠️ Storm overlay {overlay_path} missing — base only")
+    # Every alert gets an icon now, not just storms: the old overlay was the
+    # only artwork that existed, so it had to be withheld from Upał/Mróz/Wiatr
+    # rather than shown wrongly. There is a matching rcb_*.png for each of them
+    # today, and it also covers the base map's flat cartoon icon.
+    base = apply_rcb_icon(base, primary_event,
+                          warnings[0].get('stopien') if warnings else None)
 
     draw = ImageDraw.Draw(base)
     font_temp = get_font(55, bold=True)
